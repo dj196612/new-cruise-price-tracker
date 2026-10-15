@@ -1,0 +1,123 @@
+[
+  {
+    "cruise_id": "PRINCESS-sample001",
+    "line": "Princess",
+    "name": "2-Day Australia Seacation",
+    "ship": "Grand Princess",
+    "departure_port": "Sydney",
+    "arrival_port": "Brisbane",
+    "departure_date": "2026-12-09",
+    "nights": 2,
+    "itinerary": "Sydney, Australia to Brisbane, Australia",
+    "url": "https://www.princess.com/cruise-search/results/?resType=C",
+    "available": 1,
+    "one_guest_price": 856,
+    "two_guest_pp_price": 556,
+    "two_guest_total": 1112,
+    "currency": "AUD",
+    "checked_at": "2026-10-16T09:10:00+11:00",
+    "prev_price": 606,
+    "historical_low": 556,
+    "historical_high": 646,
+    "two_guest_pp_per_night": 278,
+    "one_guest_per_night": 428,
+    "solo_premium_pct": 54.0,
+    "price_change": -50,
+    "history": [
+      {
+        "checked_at": "2026-10-10T06:00:00+11:00",
+        "available": 1,
+        "one_guest_price": 910,
+        "two_guest_pp_price": 606,
+        "two_guest_total": 1212,
+        "currency": "AUD"
+      },
+      {
+        "checked_at": "2026-10-16T09:10:00+11:00",
+        "available": 1,
+        "one_guest_price": 856,
+        "two_guest_pp_price": 556,
+        "two_guest_total": 1112,
+        "currency": "AUD"
+      }
+    ]
+  },
+  {
+    "cruise_id": "PRINCESS-sample002",
+    "line": "Princess",
+    "name": "7-Day Tasmania",
+    "ship": "Royal Princess",
+    "departure_port": "Melbourne",
+    "arrival_port": "Melbourne",
+    "departure_date": "2027-01-18",
+    "nights": 7,
+    "itinerary": "Melbourne \u00b7 Tasmania \u00b7 Melbourne",
+    "url": "https://www.princess.com/en-int/cruise-destinations/departure-ports/cruises-from-melbourne-australia",
+    "available": 1,
+    "one_guest_price": 1949,
+    "two_guest_pp_price": 1359,
+    "two_guest_total": 2718,
+    "currency": "AUD",
+    "checked_at": "2026-10-16T09:10:00+11:00",
+    "prev_price": 1429,
+    "historical_low": 1299,
+    "historical_high": 1499,
+    "two_guest_pp_per_night": 194.14,
+    "one_guest_per_night": 278.43,
+    "solo_premium_pct": 43.4,
+    "price_change": -70,
+    "history": [
+      {
+        "checked_at": "2026-10-09T06:00:00+11:00",
+        "available": 1,
+        "one_guest_price": 2029,
+        "two_guest_pp_price": 1429,
+        "two_guest_total": 2858,
+        "currency": "AUD"
+      },
+      {
+        "checked_at": "2026-10-16T09:10:00+11:00",
+        "available": 1,
+        "one_guest_price": 1949,
+        "two_guest_pp_price": 1359,
+        "two_guest_total": 2718,
+        "currency": "AUD"
+      }
+    ]
+  },
+  {
+    "cruise_id": "PRINCESS-sample003",
+    "line": "Princess",
+    "name": "14-Day New Zealand",
+    "ship": "Crown Princess",
+    "departure_port": "Brisbane",
+    "arrival_port": "Brisbane",
+    "departure_date": "2027-02-12",
+    "nights": 14,
+    "itinerary": "Brisbane \u00b7 New Zealand \u00b7 Brisbane",
+    "url": "https://www.princess.com/en-int/cruise-destinations/departure-ports/cruises-from-brisbane",
+    "available": 1,
+    "one_guest_price": 2099,
+    "two_guest_pp_price": 1429,
+    "two_guest_total": 2858,
+    "currency": "AUD",
+    "checked_at": "2026-10-16T09:10:00+11:00",
+    "prev_price": 1429,
+    "historical_low": 1429,
+    "historical_high": 1599,
+    "two_guest_pp_per_night": 102.07,
+    "one_guest_per_night": 149.93,
+    "solo_premium_pct": 46.9,
+    "price_change": 0,
+    "history": [
+      {
+        "checked_at": "2026-10-16T09:10:00+11:00",
+        "available": 1,
+        "one_guest_price": 2099,
+        "two_guest_pp_price": 1429,
+        "two_guest_total": 2858,
+        "currency": "AUD"
+      }
+    ]
+  }
+]

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cruise Price Tracker — Princess</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Cruise Price Tracker</h1>
+    <p>Princess · Sydney · Brisbane · Melbourne</p>
+  </div>
+  <div class="headline">
+    <span id="resultCount">0 cruises</span>
+    <small id="updated"></small>
+  </div>
+</header>
+
+<main>
+  <section class="filters">
+    <div class="filter wide">
+      <label>Departure port</label>
+      <div id="ports" class="checks">
+        <label><input type="checkbox" value="Sydney" checked> Sydney</label>
+        <label><input type="checkbox" value="Brisbane" checked> Brisbane</label>
+        <label><input type="checkbox" value="Melbourne" checked> Melbourne</label>
+      </div>
+    </div>
+
+    <div class="filter">
+      <label>Passengers</label>
+      <select id="passengers">
+        <option value="2" selected>2 people</option>
+        <option value="1">1 person</option>
+      </select>
+    </div>
+
+    <div class="filter">
+      <label>Min nights</label>
+      <input id="minNights" type="number" min="1" value="1">
+    </div>
+    <div class="filter">
+      <label>Max nights</label>
+      <input id="maxNights" type="number" min="1" value="60">
+    </div>
+
+    <div class="filter">
+      <label>Depart from</label>
+      <input id="dateFrom" type="date">
+    </div>
+    <div class="filter">
+      <label>Depart to</label>
+      <input id="dateTo" type="date">
+    </div>
+
+    <div class="filter">
+      <label>Maximum price</label>
+      <input id="maxPrice" type="number" min="0" step="50" placeholder="Any">
+    </div>
+
+    <div class="filter">
+      <label>Ship</label>
+      <select id="ship"><option value="">All ships</option></select>
+    </div>
+
+    <div class="filter">
+      <label>Sort by</label>
+      <select id="sort">
+        <option value="dayprice">Best price per night</option>
+        <option value="price">Lowest total / fare</option>
+        <option value="date">Departure date</option>
+        <option value="drop">Largest price drop</option>
+        <option value="lengthDesc">Longest cruise</option>
+        <option value="lengthAsc">Shortest cruise</option>
+        <option value="solo">Lowest solo premium</option>
+      </select>
+    </div>
+
+    <div class="filter toggles">
+      <label><input id="available" type="checkbox" checked> Available only</label>
+      <label><input id="dropped" type="checkbox"> Price drops only</label>
+    </div>
+
+    <div class="filter action">
+      <button id="reset">Reset filters</button>
+    </div>
+  </section>
+
+  <section class="summary" id="summary"></section>
+  <section id="results" class="results"></section>
+</main>
+
+<dialog id="historyDialog">
+  <button class="close" id="closeHistory">×</button>
+  <h2 id="historyTitle">Price history</h2>
+  <div id="historyBody"></div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
