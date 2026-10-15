@@ -1,6 +1,6 @@
 let cruises = [];
 const $ = s => document.querySelector(s);
-const money = v => v == null ? "—" : new Intl.NumberFormat("en-AU",{style:"currency",currency:"AUD",maximumFractionDigits:0}).format(v);
+const money = (v,currency="AUD") => v == null ? "—" : new Intl.NumberFormat("en-AU",{style:"currency",currency:currency||"AUD",maximumFractionDigits:0}).format(v);
 const pct = v => v == null ? "—" : `${v.toFixed(1)}%`;
 
 function selectedPorts(){
@@ -46,11 +46,11 @@ function dateFmt(s){
   return new Date(s+"T12:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"});
 }
 function card(c){
-  const p=priceFor(c), ppn=perNight(c), total=currentTotal(c);
+  const p=priceFor(c), ppn=perNight(c), total=currentTotal(c), cur=c.currency||"AUD";
   const isLow = p != null && c.historical_low != null && p <= c.historical_low;
   const changeClass = c.price_change < 0 ? "drop" : "rise";
   const changeText = c.price_change == null ? "" :
-    `<span class="badge ${changeClass}">${c.price_change<0?"↓":"↑"} ${money(Math.abs(c.price_change))} since previous check</span>`;
+    `<span class="badge ${changeClass}">${c.price_change<0?"↓":"↑"} ${money(Math.abs(c.price_change),cur)} since previous check</span>`;
   const lowText = isLow ? `<span class="badge low">Historical low</span>` : "";
   const solo = c.solo_premium_pct != null ? `Solo premium ${pct(c.solo_premium_pct)}` : "Solo premium unavailable";
   return `<article class="card">
@@ -60,18 +60,19 @@ function card(c){
       <div class="route">${(c.itinerary||"").slice(0,310)}</div>
       <div class="badges">
         <span class="badge">${c.available?"Available":"Unavailable"}</span>
+        <span class="badge">${cur}</span>
         ${changeText}${lowText}
       </div>
     </div>
     <div class="pricing">
-      <div class="price">${money(p)}${p!=null?" pp":""}</div>
-      <div class="pernight">${ppn==null?"":`${money(ppn)} pp / night`}</div>
+      <div class="price">${money(p,cur)}${p!=null?" pp":""}</div>
+      <div class="pernight">${ppn==null?"":`${money(ppn,cur)} pp / night`}</div>
       <div class="secondary">
-        ${$("#passengers").value==="2" ? `2-person total: <b>${money(total)}</b><br>` : ""}
-        1 guest: <b>${money(c.one_guest_price)}</b><br>
-        2 guests pp: <b>${money(c.two_guest_pp_price)}</b><br>
+        ${$("#passengers").value==="2" ? `2-person total: <b>${money(total,cur)}</b><br>` : ""}
+        1 guest: <b>${money(c.one_guest_price,cur)}</b><br>
+        2 guests pp: <b>${money(c.two_guest_pp_price,cur)}</b><br>
         ${solo}<br>
-        Historical low: <b>${money(c.historical_low)}</b>
+        Historical low: <b>${money(c.historical_low,cur)}</b>
       </div>
     </div>
     <div class="actions">
@@ -84,21 +85,26 @@ function render(){
   let rows=sortRows(cruises.filter(passes));
   $("#resultCount").textContent=`${rows.length} cruise${rows.length===1?"":"s"}`;
   $("#results").innerHTML=rows.length?rows.map(card).join(""):`<div class="empty">No cruises match the selected filters.</div>`;
-  const dayPrices=rows.map(perNight).filter(v=>v!=null);
-  const prices=rows.map(priceFor).filter(v=>v!=null);
+  const dayRows=rows.filter(c=>perNight(c)!=null);
+  const priceRows=rows.filter(c=>priceFor(c)!=null);
+  const currencies=[...new Set(rows.map(c=>c.currency||"AUD"))];
+  const summaryCurrency=currencies.length===1?currencies[0]:null;
+  const bestDay=summaryCurrency ? Math.min(...dayRows.map(perNight)) : null;
+  const lowest=summaryCurrency ? Math.min(...priceRows.map(priceFor)) : null;
   const drops=rows.filter(c=>c.price_change<0).length;
   $("#summary").innerHTML=`
     <div class="stat"><b>${rows.length}</b><span>Matching cruises</span></div>
-    <div class="stat"><b>${money(dayPrices.length?Math.min(...dayPrices):null)}</b><span>Best price per night</span></div>
-    <div class="stat"><b>${money(prices.length?Math.min(...prices):null)}</b><span>Lowest fare</span></div>
+    <div class="stat"><b>${bestDay===null?"Mixed currencies":money(bestDay,summaryCurrency)}</b><span>Best price per night</span></div>
+    <div class="stat"><b>${lowest===null?"Mixed currencies":money(lowest,summaryCurrency)}</b><span>Lowest fare</span></div>
     <div class="stat"><b>${drops}</b><span>Current price drops</span></div>`;
 }
 window.showHistory=function(id){
   const c=cruises.find(x=>x.cruise_id===id);
+  const cur=c.currency||"AUD";
   $("#historyTitle").textContent=`Price history — ${c.name||"Princess cruise"}`;
   const h=(c.history||[]).slice().reverse();
   $("#historyBody").innerHTML=h.length?`<table class="history-table"><thead><tr><th>Checked</th><th>1 guest</th><th>2 guests pp</th></tr></thead><tbody>
-  ${h.map(x=>`<tr><td>${new Date(x.checked_at).toLocaleString("en-AU")}</td><td>${money(x.one_guest_price)}</td><td>${money(x.two_guest_pp_price)}</td></tr>`).join("")}
+  ${h.map(x=>`<tr><td>${new Date(x.checked_at).toLocaleString("en-AU")}</td><td>${money(x.one_guest_price,x.currency||cur)}</td><td>${money(x.two_guest_pp_price,x.currency||cur)}</td></tr>`).join("")}
   </tbody></table>`:"No historical observations yet.";
   $("#historyDialog").showModal();
 }
