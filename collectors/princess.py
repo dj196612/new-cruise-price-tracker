@@ -39,7 +39,6 @@ def departure_port(text: str) -> Optional[str]:
     m = ROUTE_RE.search(text or "")
     if m:
         return m.group(1).title()
-
     before_ports = re.split(r"\b\d+\s+Ports?:|\b0\s+Ports?:", text or "", maxsplit=1, flags=re.I)[0]
     hits = []
     for p in PORTS:
@@ -146,12 +145,11 @@ async def select_australian_departure_ports(page: Page) -> int:
     return expected
 
 
-async def visible_result_count(page: Page) -> int:
-    headings = page.locator("h2").filter(has_text=re.compile(r"\d+\s*[- ]?Day", re.I))
-    count = await headings.count()
-    if count:
-        return count
-    return await page.get_by_text(re.compile(r"View Details|Cruise Details", re.I)).count()
+async def itinerary_link_count(page: Page) -> int:
+    hrefs = await page.locator('a[href*="itinerary-details"]').evaluate_all(
+        "els => [...new Set(els.map(e => e.href).filter(Boolean))].length"
+    )
+    return int(hrefs or 0)
 
 
 async def load_all_results(page: Page, expected: int) -> int:
@@ -159,8 +157,8 @@ async def load_all_results(page: Page, expected: int) -> int:
     stable_rounds = 0
 
     for _ in range(20):
-        count = await visible_result_count(page)
-        print(f"Princess cards currently loaded: {count} / expected {expected}")
+        count = await itinerary_link_count(page)
+        print(f"Princess unique itinerary links loaded: {count} / expected {expected}")
         if count >= expected:
             return count
 
@@ -179,7 +177,7 @@ async def load_all_results(page: Page, expected: int) -> int:
                     clicked = True
                     for _ in range(12):
                         await page.wait_for_timeout(500)
-                        if await visible_result_count(page) > before:
+                        if await itinerary_link_count(page) > before:
                             break
                     break
             except Exception:
@@ -189,17 +187,16 @@ async def load_all_results(page: Page, expected: int) -> int:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1500)
 
-        new_count = await visible_result_count(page)
+        new_count = await itinerary_link_count(page)
         if new_count == previous:
             stable_rounds += 1
         else:
             stable_rounds = 0
         previous = new_count
-
         if stable_rounds >= 3:
             break
 
-    return await visible_result_count(page)
+    return await itinerary_link_count(page)
 
 
 async def choose_guest_count(page: Page, guests: int) -> bool:
@@ -234,87 +231,57 @@ async def choose_guest_count(page: Page, guests: int) -> bool:
     return False
 
 
-async def result_cards(page: Page):
-    headings = page.locator("h2").filter(has_text=re.compile(r"\d+\s*[- ]?Day", re.I))
-    cards = []
-    for i in range(await headings.count()):
-        node = headings.nth(i)
-        selected = None
-        for _ in range(10):
-            node = node.locator("xpath=..")
-            try:
-                txt = await node.inner_text(timeout=1000)
-            except Exception:
-                continue
-            if re.search(r"View Details|Cruise Details", txt, re.I) and NIGHTS_RE.search(txt):
-                selected = node
-                break
-        if selected is not None:
-            cards.append(selected)
-    return cards
+async def raw_itineraries(page: Page):
+    return await page.locator('a[href*="itinerary-details"]').evaluate_all(
+        r"""els => {
+            const seen = new Set();
+            const out = [];
+            for (const a of els) {
+                const href = a.href;
+                if (!href || seen.has(href)) continue;
+                seen.add(href);
+
+                let node = a;
+                let chosen = null;
+                for (let i = 0; i < 12 && node; i++, node = node.parentElement) {
+                    const txt = (node.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (/\d+\s*-?\s*Day/i.test(txt) && /Interior\s+from|Includes taxes|Price in/i.test(txt)) {
+                        chosen = node;
+                        break;
+                    }
+                }
+                if (!chosen) chosen = a.parentElement || a;
+                const text = (chosen.innerText || '').replace(/\s+/g, ' ').trim();
+                const options = [...chosen.querySelectorAll('option')].map(o => o.innerText).join(' ');
+                out.push({href, text, options});
+            }
+            return out;
+        }"""
+    )
 
 
 async def extract_cards(page: Page, guests: int):
-    cards = await result_cards(page)
+    rows = await raw_itineraries(page)
     results = []
-    seen = set()
 
-    for card in cards:
-        try:
-            text = " ".join((await card.inner_text(timeout=2500)).split())
-        except Exception:
-            continue
-
+    for row in rows:
+        text = row.get("text", "")
         n = NIGHTS_RE.search(text)
         if not n:
             continue
         nights = int(n.group(1))
+
         dep = departure_port(text)
         if dep not in PORTS:
             continue
 
-        name = None
-        try:
-            h2 = card.locator("h2")
-            if await h2.count():
-                name = " ".join((await h2.first.inner_text()).split())
-        except Exception:
-            pass
-        if not name or not NIGHTS_RE.search(name):
-            name = cruise_name(text, nights)
-
-        departure_date = parse_date(text)
-        ship_match = SHIP_RE.search(text)
+        name = cruise_name(text, nights)
+        departure_date = parse_date(text) or parse_date(row.get("options", ""))
+        ship_match = SHIP_RE.search(text + " " + row.get("options", ""))
         ship = ship_match.group(0) if ship_match else None
         price = current_price(text)
         currency = detect_currency(text)
-
-        url = LANDING_URL
-        try:
-            links = card.locator("a")
-            for j in range(await links.count()):
-                href = await links.nth(j).get_attribute("href")
-                label = " ".join((await links.nth(j).inner_text()).split())
-                if href and ("itinerary" in href.lower() or "view details" in label.lower()):
-                    url = href if href.startswith("http") else "https://www.princess.com" + href
-                    break
-        except Exception:
-            pass
-
-        if departure_date is None:
-            try:
-                option_text = " ".join(await card.locator("option").all_inner_texts())
-                departure_date = parse_date(option_text)
-                if ship is None:
-                    sm = SHIP_RE.search(option_text)
-                    ship = sm.group(0) if sm else None
-            except Exception:
-                pass
-
-        identity = (name, departure_date, ship, dep, url)
-        if identity in seen:
-            continue
-        seen.add(identity)
+        url = row.get("href") or LANDING_URL
 
         record = {
             "line": "Princess",
@@ -330,7 +297,6 @@ async def extract_cards(page: Page, guests: int):
             "currency": currency,
         }
         record["cruise_id"] = make_id(ship or "UNKNOWN", departure_date or "UNKNOWN", dep, name, url)
-
         if guests == 1:
             record["one_guest_price"] = price
         else:
@@ -368,7 +334,7 @@ async def collect(headless=True):
 
         expected = await select_australian_departure_ports(page)
         loaded = await load_all_results(page, expected)
-        print(f"Princess result loading finished at {loaded} visible cards (expected {expected}).")
+        print(f"Princess result loading finished at {loaded} unique itinerary links (expected {expected}).")
 
         two = await extract_cards(page, 2)
         print(f"Parsed {len(two)} two-guest Princess sailings.")
@@ -387,12 +353,6 @@ async def collect(headless=True):
             f"expected={expected}\nloaded={loaded}\ntwo_guest_parsed={len(two)}\none_guest_parsed={len(one)}\nmerged={len(records)}\n",
             encoding="utf-8",
         )
-
-        if not records:
-            try:
-                await page.screenshot(path=str(debug / "princess-no-results.png"), full_page=False, timeout=10000)
-            except Exception as exc:
-                print(f"Diagnostic screenshot failed: {exc}")
 
         await browser.close()
         return records
