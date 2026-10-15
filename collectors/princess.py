@@ -8,8 +8,9 @@ from typing import Optional
 
 from playwright.async_api import async_playwright, Page
 
-SEARCH_URL = "https://www.princess.com/cruise-search/search?resType=C&sortBy=priceLowToHigh"
-PORTS = ("Sydney", "Brisbane", "Melbourne")
+LANDING_URL = "https://www.princess.com/cruise-search/"
+FALLBACK_SEARCH_URL = "https://www.princess.com/cruise-search/search?resType=C&sortBy=priceLowToHigh"
+PORTS = ("Sydney", "Melbourne", "Brisbane")
 
 MONEY_RE = re.compile(r"\$\s*([\d,]+(?:\.\d{1,2})?)")
 NIGHTS_RE = re.compile(r"(\d+)\s*[- ]?\s*(?:Day|Night)", re.I)
@@ -23,12 +24,10 @@ SHIP_RE = re.compile(
     r"(Caribbean|Coral|Crown|Diamond|Discovery|Emerald|Enchanted|Grand|Island|Majestic|Regal|Royal|Ruby|Sapphire|Sky|Star|Sun)\s+Princess",
     re.I,
 )
-PORT_RE = re.compile(r"(?:^|[•,])\s*([^•]+?),\s*Australia\s*(?=•|,|$)", re.I)
-
-
-def money(text: str) -> Optional[float]:
-    m = MONEY_RE.search(text or "")
-    return float(m.group(1).replace(",", "")) if m else None
+ROUTE_RE = re.compile(
+    r"(Sydney|Melbourne|Brisbane),\s*Australia\s+to\s+([^\n]{1,100}?),\s*Australia",
+    re.I,
+)
 
 
 def parse_date(text: str) -> Optional[str]:
@@ -40,20 +39,54 @@ def parse_date(text: str) -> Optional[str]:
 
 
 def departure_port(text: str) -> Optional[str]:
-    # Princess lists the departure port first in each itinerary string.
-    m = PORT_RE.search(text or "")
+    # Prefer the explicit route, e.g. "Brisbane, Australia to Sydney, Australia".
+    m = ROUTE_RE.search(text or "")
     if m:
-        first = m.group(1).strip()
-        for p in PORTS:
-            if first.lower() == p.lower():
-                return p
+        return m.group(1).title()
 
-    # Conservative fallback for cards whose accessible text omits separators.
-    beginning = (text or "")[:220].lower()
+    # Fallback: use the first tracked Australian port occurrence before the port list.
+    before_ports = re.split(r"\b\d+\s+Ports?:|\b0\s+Ports?:", text or "", maxsplit=1, flags=re.I)[0]
+    hits = []
     for p in PORTS:
-        if f"{p.lower()}, australia" in beginning:
-            return p
+        pos = before_ports.lower().find(f"{p.lower()}, australia")
+        if pos >= 0:
+            hits.append((pos, p))
+    if hits:
+        return min(hits)[1]
     return None
+
+
+def current_price(text: str) -> Optional[float]:
+    """Return the currently advertised fare, not a crossed-out 'Was' fare."""
+    patterns = (
+        r"\bNow\s*\$\s*([\d,]+(?:\.\d+)?)",
+        r"\bWas\s*\$\s*[\d,]+(?:\.\d+)?\s*(?:Now\s*)?\$\s*([\d,]+(?:\.\d+)?)",
+        r"Interior\s+from\D{0,20}\$\s*([\d,]+(?:\.\d+)?)",
+        r"\bfrom\D{0,20}\$\s*([\d,]+(?:\.\d+)?)",
+        r"\$\s*([\d,]+(?:\.\d+)?)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text or "", re.I)
+        if m:
+            return float(m.group(1).replace(",", ""))
+    return None
+
+
+def detect_currency(text: str) -> str:
+    m = re.search(r"Price\s+in\s+(AUD|USD|NZD|CAD|GBP|EUR)", text or "", re.I)
+    return m.group(1).upper() if m else "AUD"
+
+
+def cruise_name(text: str, nights: int) -> str:
+    # Capture the title immediately before the explicit route.
+    m = re.search(
+        r"(\d+\s*[- ]?Day\s+.{2,120}?)(?=(?:Save)?(?:Sydney|Melbourne|Brisbane),\s*Australia\s+to)",
+        text,
+        re.I,
+    )
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return f"{nights}-Day Princess Cruise"
 
 
 def make_id(ship: str, date: str, dep: str, name: str, url: str = "") -> str:
@@ -66,29 +99,127 @@ async def dismiss_noise(page: Page):
     for label in ("Accept All Cookies", "Accept Cookies", "Accept", "I Agree", "Close"):
         try:
             btn = page.get_by_role("button", name=re.compile(label, re.I))
-            if await btn.count():
-                await btn.first.click(timeout=1200)
+            if await btn.count() and await btn.first.is_visible():
+                await btn.first.click(timeout=1500)
         except Exception:
             pass
 
 
-async def load_all_results(page: Page):
-    # Search results are progressively loaded. Keep pressing Load More until it disappears.
-    for _ in range(30):
-        try:
-            button = page.get_by_role("button", name=re.compile(r"^Load More$", re.I))
-            if not await button.count() or not await button.first.is_visible():
-                break
-            await button.first.click(timeout=5000)
-            await page.wait_for_timeout(1200)
-        except Exception:
+async def select_australian_departure_ports(page: Page) -> Optional[int]:
+    """Reproduce the browser search: Sydney + Melbourne + Brisbane, then View Results."""
+    try:
+        await page.goto(LANDING_URL, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(4500)
+        await dismiss_noise(page)
+
+        trigger = page.get_by_text(re.compile(r"^Departure Port$", re.I))
+        if await trigger.count():
+            await trigger.first.click(timeout=4000)
+            await page.wait_for_timeout(800)
+
+        for port in PORTS:
+            target = page.get_by_text(re.compile(rf"^{port},\s*Australia$", re.I))
+            clicked = False
+            for i in range(await target.count()):
+                try:
+                    item = target.nth(i)
+                    if await item.is_visible():
+                        await item.click(timeout=3000)
+                        await page.wait_for_timeout(350)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                raise RuntimeError(f"Could not select departure port: {port}")
+
+        view = page.get_by_text(re.compile(r"VIEW\s+\d+\s+RESULTS", re.I))
+        if not await view.count():
+            raise RuntimeError("Could not find Princess View Results button")
+
+        label = " ".join((await view.first.inner_text()).split())
+        m = re.search(r"(\d+)", label)
+        expected = int(m.group(1)) if m else None
+        print(f"Princess search reports {expected or '?'} matching cruises for Sydney/Melbourne/Brisbane.")
+
+        await view.first.click(timeout=5000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(5000)
+        return expected
+    except Exception as exc:
+        print(f"Departure-port search UI failed ({exc}); using direct results URL fallback.")
+        await page.goto(FALLBACK_SEARCH_URL, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(6000)
+        await dismiss_noise(page)
+        return None
+
+
+async def visible_result_count(page: Page) -> int:
+    headings = page.locator("h2").filter(has_text=re.compile(r"\d+\s*[- ]?Day", re.I))
+    count = await headings.count()
+    if count:
+        return count
+    return await page.get_by_text(re.compile(r"View Details|Cruise Details", re.I)).count()
+
+
+async def load_all_results(page: Page, expected: Optional[int] = None) -> int:
+    """Load every progressively rendered result, using both button clicks and scroll fallback."""
+    previous = -1
+    stable_rounds = 0
+
+    for _ in range(60):
+        count = await visible_result_count(page)
+        if expected and count >= expected:
+            print(f"Loaded all {count} Princess result cards.")
+            return count
+
+        clicked = False
+        candidates = [
+            page.locator("button").filter(has_text=re.compile(r"Load More|Show More|More Results", re.I)),
+            page.get_by_text(re.compile(r"^\s*(Load More|Show More|More Results)\s*$", re.I)),
+        ]
+        for candidate in candidates:
+            try:
+                if await candidate.count():
+                    btn = candidate.first
+                    if await btn.is_visible():
+                        await btn.scroll_into_view_if_needed()
+                        before = count
+                        try:
+                            await btn.click(timeout=5000)
+                        except Exception:
+                            await btn.click(timeout=5000, force=True)
+                        clicked = True
+                        # Give React enough time to append the next batch.
+                        for _ in range(16):
+                            await page.wait_for_timeout(500)
+                            if await visible_result_count(page) > before:
+                                break
+                        break
+            except Exception:
+                continue
+
+        if not clicked:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1500)
+
+        new_count = await visible_result_count(page)
+        print(f"Princess cards currently loaded: {new_count}" + (f" / expected {expected}" if expected else ""))
+
+        if new_count == previous:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        previous = new_count
+
+        if stable_rounds >= 3 and not clicked:
             break
+
+    return await visible_result_count(page)
 
 
 async def choose_guest_count(page: Page, guests: int) -> bool:
-    """Best-effort guest selection. Failure is non-fatal; cards can still be collected."""
     await dismiss_noise(page)
-
     triggers = [
         page.get_by_text(re.compile(r"Guests?:\s*\d+", re.I)),
         page.get_by_role("button", name=re.compile(r"Rooms?\s*&\s*guests?|Guests?", re.I)),
@@ -104,6 +235,7 @@ async def choose_guest_count(page: Page, guests: int) -> bool:
     else:
         return False
 
+    # Direct selection if Princess exposes 1 Guest / 2 Guests choices.
     for pattern in (rf"^{guests}\s*Guests?$", rf"{guests}\s*guests? selected"):
         try:
             option = page.get_by_text(re.compile(pattern, re.I))
@@ -112,7 +244,7 @@ async def choose_guest_count(page: Page, guests: int) -> bool:
                 apply = page.get_by_role("button", name=re.compile(r"^Apply$", re.I))
                 if await apply.count() and await apply.last.is_visible():
                     await apply.last.click(timeout=2000)
-                await page.wait_for_timeout(1800)
+                await page.wait_for_timeout(2000)
                 return True
         except Exception:
             pass
@@ -120,55 +252,31 @@ async def choose_guest_count(page: Page, guests: int) -> bool:
 
 
 async def result_cards(page: Page):
-    # New Princess search renders itinerary names as H2 headings with a View Details action.
     headings = page.locator("h2").filter(has_text=re.compile(r"\d+\s*[- ]?Day", re.I))
-    if await headings.count():
-        cards = []
-        for i in range(await headings.count()):
-            heading = headings.nth(i)
-            # Walk up until the element contains the result action.
-            node = heading
-            selected = None
-            for _ in range(8):
-                node = node.locator("xpath=..")
-                try:
-                    txt = await node.inner_text(timeout=1000)
-                except Exception:
-                    continue
-                if re.search(r"View Details|Cruise Details", txt, re.I):
-                    selected = node
-                    break
-            if selected is not None:
-                cards.append(selected)
-        if cards:
-            return cards
-
-    # Compatibility fallbacks for alternate Princess deployments.
-    for selector in (
-        "article",
-        "[data-testid*='cruise']",
-        "[class*='cruise-card']",
-        "[class*='CruiseCard']",
-        "[class*='search-result']",
-    ):
-        loc = page.locator(selector)
-        if await loc.count() >= 2:
-            return [loc.nth(i) for i in range(await loc.count())]
-
-    buttons = page.get_by_text(re.compile(r"View Details|Cruise Details", re.I))
     cards = []
-    for i in range(await buttons.count()):
-        node = buttons.nth(i)
-        for _ in range(8):
+    for i in range(await headings.count()):
+        node = headings.nth(i)
+        selected = None
+        for _ in range(10):
             node = node.locator("xpath=..")
             try:
                 txt = await node.inner_text(timeout=1000)
             except Exception:
                 continue
-            if NIGHTS_RE.search(txt):
-                cards.append(node)
+            if re.search(r"View Details|Cruise Details", txt, re.I) and NIGHTS_RE.search(txt):
+                selected = node
                 break
-    return cards
+        if selected is not None:
+            cards.append(selected)
+    if cards:
+        return cards
+
+    # Compatibility fallbacks.
+    for selector in ("article", "[data-testid*='cruise']", "[class*='cruise-card']", "[class*='CruiseCard']", "[class*='search-result']"):
+        loc = page.locator(selector)
+        if await loc.count() >= 2:
+            return [loc.nth(i) for i in range(await loc.count())]
+    return []
 
 
 async def extract_cards(page: Page, guests: int):
@@ -178,20 +286,18 @@ async def extract_cards(page: Page, guests: int):
 
     for card in cards:
         try:
-            raw = await card.inner_text(timeout=2500)
-            text = " ".join(raw.split())
+            text = " ".join((await card.inner_text(timeout=2500)).split())
         except Exception:
             continue
 
         n = NIGHTS_RE.search(text)
         if not n:
             continue
+        nights = int(n.group(1))
 
         dep = departure_port(text)
         if dep not in PORTS:
             continue
-
-        nights = int(n.group(1))
 
         name = None
         try:
@@ -200,42 +306,27 @@ async def extract_cards(page: Page, guests: int):
                 name = " ".join((await h2.first.inner_text()).split())
         except Exception:
             pass
-        if not name:
-            m = re.search(r"(\d+\s*[- ]?Day\s+.{2,100}?)(?=\d+\s+ports?|Price|View Details|$)", text, re.I)
-            name = m.group(1).strip() if m else f"{nights}-Day Princess Cruise"
+        if not name or not NIGHTS_RE.search(name):
+            name = cruise_name(text, nights)
 
         departure_date = parse_date(text)
+        ship_match = SHIP_RE.search(text)
+        ship = ship_match.group(0) if ship_match else None
+        price = current_price(text)
+        currency = detect_currency(text)
 
-        ship = None
-        sm = SHIP_RE.search(text)
-        if sm:
-            ship = sm.group(0)
-
-        # AU Princess normally labels the displayed fare as Interior from $X.
-        price = None
-        for pattern in (
-            r"Interior\s+from\D{0,30}\$\s*([\d,]+(?:\.\d+)?)",
-            r"from\D{0,20}\$\s*([\d,]+(?:\.\d+)?)",
-            r"\$\s*([\d,]+(?:\.\d+)?)",
-        ):
-            pm = re.search(pattern, text, re.I)
-            if pm:
-                price = float(pm.group(1).replace(",", ""))
-                break
-
-        url = SEARCH_URL
+        url = FALLBACK_SEARCH_URL
         try:
             links = card.locator("a")
             for j in range(await links.count()):
                 href = await links.nth(j).get_attribute("href")
                 label = " ".join((await links.nth(j).inner_text()).split())
-                if href and ("itinerary" in href.lower() or "view details" in label.lower() or "cruise" in href.lower()):
+                if href and ("itinerary" in href.lower() or "view details" in label.lower()):
                     url = href if href.startswith("http") else "https://www.princess.com" + href
                     break
         except Exception:
             pass
 
-        # Use options/select text as a second chance to obtain date/ship when hidden from card text.
         if departure_date is None:
             try:
                 option_text = " ".join(await card.locator("option").all_inner_texts())
@@ -259,10 +350,10 @@ async def extract_cards(page: Page, guests: int):
             "arrival_port": None,
             "departure_date": departure_date,
             "nights": nights,
-            "itinerary": text[:800],
+            "itinerary": text[:900],
             "url": url,
             "available": "sold out" not in text.lower() and "unavailable" not in text.lower(),
-            "currency": "AUD",
+            "currency": currency,
         }
         record["cruise_id"] = make_id(ship or "UNKNOWN", departure_date or "UNKNOWN", dep, name, url)
 
@@ -278,11 +369,12 @@ async def extract_cards(page: Page, guests: int):
 
 def merge(one, two):
     merged = {}
-    for r in one + two:
+    for r in two + one:
         key = r["cruise_id"]
         if key not in merged:
             merged[key] = r.copy()
         else:
+            # Do not let a one-guest scrape overwrite two-guest currency/metadata with blanks.
             merged[key].update({k: v for k, v in r.items() if v is not None})
     return list(merged.values())
 
@@ -297,35 +389,31 @@ async def collect(headless=True):
             locale="en-AU",
             timezone_id="Australia/Sydney",
             viewport={"width": 1440, "height": 1200},
+            extra_http_headers={"Accept-Language": "en-AU,en;q=0.9"},
         )
         page = await context.new_page()
-        await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_timeout(7000)
-        await dismiss_noise(page)
 
-        # Wait for the new Princess result page instead of assuming cards are ready after DOMContentLoaded.
-        try:
-            await page.get_by_text(re.compile(r"Search Results|We found \d+ cruises", re.I)).first.wait_for(timeout=15000)
-        except Exception:
-            pass
+        expected = await select_australian_departure_ports(page)
+        loaded = await load_all_results(page, expected)
+        print(f"Princess result loading finished at {loaded} visible cards.")
 
-        await load_all_results(page)
-
-        # Capture default pricing first. Princess AU normally defaults to two guests.
         two = await extract_cards(page, 2)
+        print(f"Parsed {len(two)} two-guest Princess sailings.")
 
-        # Then attempt to switch to one guest. If the search UI does not expose the control,
-        # keep the two-guest results and leave solo pricing blank rather than losing all cruises.
         one = []
         if await choose_guest_count(page, 1):
-            await load_all_results(page)
+            await load_all_results(page, expected)
             one = await extract_cards(page, 1)
+            print(f"Parsed {len(one)} one-guest Princess sailings.")
 
         records = merge(one, two)
 
-        # Always save a lightweight diagnostics snapshot; on failures the workflow uploads it.
         (debug / "princess-page-url.txt").write_text(page.url, encoding="utf-8")
-        (debug / "princess-page-text.txt").write_text((await page.locator("body").inner_text())[:250000], encoding="utf-8")
+        (debug / "princess-page-text.txt").write_text((await page.locator("body").inner_text())[:300000], encoding="utf-8")
+        (debug / "princess-counts.txt").write_text(
+            f"expected={expected}\nloaded={loaded}\ntwo_guest_parsed={len(two)}\none_guest_parsed={len(one)}\nmerged={len(records)}\n",
+            encoding="utf-8",
+        )
 
         if not records:
             await page.screenshot(path=str(debug / "princess-no-results.png"), full_page=True)
