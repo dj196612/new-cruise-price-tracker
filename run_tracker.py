@@ -1,7 +1,9 @@
 import asyncio
+
 from collectors.princess import collect
-from storage import save_observations
 from export_json import main as export_json
+from storage import save_observations
+
 
 async def main():
     print("Collecting Princess cruises...")
@@ -12,8 +14,10 @@ async def main():
             "No Princess cruises were found. Check debug/princess-no-results.png "
             "and debug/princess-no-results.html for the current Princess page."
         )
-    save_observations(records)
+
+    save_observations(records, line="Princess")
     export_json()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
