@@ -602,6 +602,20 @@ async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -
         if 0.97 <= median <= 1.03 and (best is None or abs(median - 1) < abs(best[1] - 1)):
             best = (mode, median)
 
+    # Which fare type does the page's 2-guest price actually show?
+    for fare_type in ("BESTFARE", "BESTVALUE", "PREMIER"):
+        ratios = []
+        for page, cruises in samples:
+            api = _solo_cabin_prices(cruises, fare_type=fare_type, mode="fare")[0].get("interior")
+            if api:
+                ratios.append(api / page)
+        if ratios:
+            ratios.sort()
+            print(
+                f"Princess calibration fare type {fare_type}: median API/page ratio "
+                f"{ratios[len(ratios) // 2]:.3f} over {len(ratios)} voyages (range {ratios[0]:.3f}-{ratios[-1]:.3f})"
+            )
+
     _price_mode["scale"] = 1.0
     if best:
         _price_mode["value"] = best[0]
