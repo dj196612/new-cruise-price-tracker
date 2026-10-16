@@ -41,30 +41,21 @@ def _select_sailing(body: dict, package: str, sail_date: str) -> dict | None:
     rows = body.get("sailings") or []
     if not rows:
         return None
-
     target_id = f"{package}_{sail_date}"
     package_norm = _normalise(package)
-
     for row in rows:
         if row.get("id") == target_id:
             return row
-
     for row in rows:
         row_date = (row.get("sailDate") or row.get("startDate") or "")[:10]
         row_package = _normalise(row.get("packageCode") or ((row.get("itinerary") or {}).get("code")))
         if row_date == sail_date and row_package == package_norm:
             return row
-
-    date_matches = [
-        row for row in rows
-        if (row.get("sailDate") or row.get("startDate") or "")[:10] == sail_date
-    ]
+    date_matches = [row for row in rows if (row.get("sailDate") or row.get("startDate") or "")[:10] == sail_date]
     if len(date_matches) == 1:
         return date_matches[0]
-
     if len(rows) == 1:
         return rows[0]
-
     return None
 
 
@@ -77,9 +68,7 @@ def _solo_prices(sailing: dict) -> dict[str, float | None]:
         pricing = room.get("pricing") or {}
         candidates = [pricing.get("total"), pricing.get("amount"), pricing.get("price")]
         value = next((float(v) for v in candidates if isinstance(v, (int, float)) and v > 0), None)
-        if value is None:
-            continue
-        if out[kind] is None or value < out[kind]:
+        if value is not None and (out[kind] is None or value < out[kind]):
             out[kind] = value
     return out
 
@@ -100,7 +89,6 @@ async def _fetch_solo(request, *, room_url: str, referer: str, package: str, sai
         "accept-language": "en-AU,en;q=0.9",
         "referer": referer,
     }
-
     for attempt in range(1, 3):
         try:
             response = await request.get(room_url, params=params, headers=headers, timeout=30000)
@@ -134,28 +122,18 @@ async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
 
     fixed = 0
     async with async_playwright() as p:
-        request = await p.request.new_context(
-            extra_http_headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
-            }
-        )
-
+        request = await p.request.new_context(extra_http_headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
+        })
         for record in missing:
             parts = (record.get("cruise_id") or "").split(":")
             if len(parts) < 3 or parts[0] != config["prefix"]:
                 continue
             package = parts[1]
             sail_date = record.get("departure_date") or parts[2]
-            prices = await _fetch_solo(
-                request,
-                room_url=config["room_url"],
-                referer=config["referer"],
-                package=package,
-                sail_date=sail_date,
-            )
+            prices = await _fetch_solo(request, room_url=config["room_url"], referer=config["referer"], package=package, sail_date=sail_date)
             if not prices or prices.get("interior") is None:
                 continue
-
             record["one_guest_price"] = prices["interior"]
             record["one_guest_interior"] = prices["interior"]
             record["one_guest_oceanview"] = prices.get("oceanview")
@@ -163,12 +141,8 @@ async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
             record["one_guest_suite"] = prices.get("suite")
             record["available"] = True
             fixed += 1
-            print(
-                f"{line} solo repair fixed {sail_date} {record.get('name')} "
-                f"Interior=AUD {prices['interior']:.0f}"
-            )
+            print(f"{line} solo repair fixed {sail_date} {record.get('name')} Interior=AUD {prices['interior']:.0f}")
             await asyncio.sleep(0.1)
-
         await request.dispose()
 
     print(f"{line} solo repair result: {fixed}/{len(missing)} missing solo Interior prices repaired")
