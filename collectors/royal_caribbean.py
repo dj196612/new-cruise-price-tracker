@@ -34,9 +34,9 @@ QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $so
 
 
 def _headers() -> dict[str, str]:
-    # Royal's public cruise catalogue is reliably populated with its standard
-    # anonymous US search headers. We only use this call for sailing metadata;
-    # pricing below is still requested explicitly for AUS / AUD / SYD.
+    # Royal's public catalogue is reliably populated using its standard
+    # anonymous US search context. This is metadata discovery only; pricing
+    # below is explicitly requested for Australia in AUD.
     return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -80,10 +80,10 @@ async def _search(request):
     response = await request.post(GRAPH_URL, headers=_headers(), data=json.dumps(payload), timeout=30000)
     text = await response.text()
     print(f"RC_GRAPH_STATUS {response.status}")
-    print(f"RC_GRAPH_BODY {' '.join(text.split())[:12000]}")
     try:
         data = json.loads(text)
     except Exception:
+        print(f"RC_GRAPH_NON_JSON {' '.join(text.split())[:2000]}")
         return []
     if data.get("errors"):
         print(f"RC_GRAPH_ERRORS {json.dumps(data['errors'])[:4000]}")
@@ -100,17 +100,38 @@ async def _search(request):
     return local
 
 
+def _room_summary(sailing: dict) -> dict:
+    out = {}
+    for room in sailing.get("rooms") or []:
+        code = (room.get("code") or "").upper()
+        mapped = {
+            "INTERIOR": "interior",
+            "OUTSIDE": "oceanview",
+            "BALCONY": "balcony",
+            "DELUXE": "suite",
+        }.get(code)
+        if not mapped:
+            continue
+        pricing = room.get("pricing") or {}
+        out[mapped] = {
+            "per_person": pricing.get("amount"),
+            "total": pricing.get("total"),
+            "category": room.get("categoryCode"),
+        }
+    return out
+
+
 async def _price(request, sailing: dict, adults: int):
     sailing_id = sailing.get("id")
     package = _package_code(sailing_id)
-    sail_date = sailing.get("sailDate") or sailing.get("startDate")
+    sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
     if not package or not sail_date:
         print(f"RC_PRICE_SKIP adults={adults} sailing_id={sailing_id} sail_date={sail_date}")
-        return
+        return None
 
     params = {
         "packageCode": package,
-        "sailDate": sail_date[:10],
+        "sailDate": sail_date,
         "adults": str(adults),
         "children": "0",
         "countryCode": "AUS",
@@ -129,8 +150,44 @@ async def _price(request, sailing: dict, adults: int):
         timeout=30000,
     )
     text = await response.text()
-    print(f"RC_PRICE_STATUS adults={adults} package={package} date={sail_date[:10]} status={response.status}")
-    print(f"RC_PRICE_BODY adults={adults} {' '.join(text.split())[:12000]}")
+    print(f"RC_PRICE_STATUS adults={adults} package={package} date={sail_date} status={response.status}")
+    try:
+        body = json.loads(text)
+    except Exception:
+        print(f"RC_PRICE_NON_JSON adults={adults} {' '.join(text.split())[:2000]}")
+        return None
+
+    target_id = f"{package}_{sail_date}"
+    returned = body.get("sailings") or []
+    exact = next(
+        (
+            s for s in returned
+            if s.get("id") == target_id
+            or (s.get("packageCode") == package and (s.get("sailDate") or s.get("startDate")) == sail_date)
+        ),
+        None,
+    )
+    if exact is None:
+        alternatives = [
+            {
+                "id": s.get("id"),
+                "packageCode": s.get("packageCode"),
+                "sailDate": s.get("sailDate") or s.get("startDate"),
+            }
+            for s in returned[:10]
+        ]
+        print(
+            f"RC_PRICE_NO_EXACT_MATCH adults={adults} package={package} date={sail_date} "
+            + json.dumps(alternatives, separators=(",", ":"))
+        )
+        return None
+
+    summary = _room_summary(exact)
+    print(
+        f"RC_PRICE_EXACT_MATCH adults={adults} package={package} date={sail_date} "
+        + json.dumps(summary, separators=(",", ":"))
+    )
+    return summary
 
 
 async def diagnostic(headless: bool = True):
@@ -164,8 +221,12 @@ async def diagnostic(headless: bool = True):
             break
 
         if sample:
-            await _price(request, sample, 1)
-            await _price(request, sample, 2)
+            solo = await _price(request, sample, 1)
+            double = await _price(request, sample, 2)
+            print(
+                "RC_OCCUPANCY_RESULT "
+                + json.dumps({"solo_available": solo is not None, "double_available": double is not None})
+            )
         else:
             print("RC_NO_SAMPLE_SAILING")
         await request.dispose()
@@ -174,5 +235,5 @@ async def diagnostic(headless: bool = True):
 async def collect(headless: bool = True):
     await diagnostic(headless=headless)
     raise RuntimeError(
-        "Royal Caribbean API diagnostic complete. Inspect RC_GRAPH_* and RC_PRICE_* lines before enabling publication."
+        "Royal Caribbean API diagnostic complete. Inspect RC_PRICE_EXACT_MATCH / RC_PRICE_NO_EXACT_MATCH before publication."
     )
