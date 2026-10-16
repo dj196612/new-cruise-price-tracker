@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from urllib.parse import urlencode
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 GRAPH_URL = "https://www.royalcaribbean.com/graph"
 ROOM_URL = "https://www.royalcaribbean.com/itinerary/api/v1/sailings"
@@ -157,16 +158,39 @@ async def _price(request, sailing: dict, adults: int) -> dict | None:
         "languageCode": "en",
         "officeCode": "SYD",
     }
-    response = await request.get(
-        ROOM_URL,
-        params=params,
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-AU,en;q=0.9",
-            "referer": "https://www.royalcaribbean.com/aus/en/cruises",
-        },
-        timeout=30000,
-    )
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en-AU,en;q=0.9",
+        "referer": "https://www.royalcaribbean.com/aus/en/cruises",
+    }
+
+    response = None
+    for attempt in range(1, 3):
+        try:
+            response = await request.get(
+                ROOM_URL,
+                params=params,
+                headers=headers,
+                timeout=30000,
+            )
+            break
+        except PlaywrightTimeoutError:
+            print(
+                f"RC price timeout attempt={attempt}/2 adults={adults} "
+                f"package={package} date={sail_date}"
+            )
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            print(
+                f"RC price request error adults={adults} package={package} "
+                f"date={sail_date}: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+    if response is None:
+        print(f"RC price skipped after retries: adults={adults} package={package} date={sail_date}")
+        return None
     if response.status not in (200, 404):
         print(f"RC price HTTP {response.status}: adults={adults} package={package} date={sail_date}")
         return None
