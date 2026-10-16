@@ -17,7 +17,7 @@ async def _first_visible(locator):
 
 
 async def _set_guest_count(page, guests: int) -> bool:
-    """Set Princess detail-page occupancy to the requested guest count."""
+    """Set Princess detail-page occupancy and force pricing to reload."""
     current = await _first_visible(
         page.get_by_text(re.compile(r"1\s*room\s*/\s*\d+\s*guests?", re.I))
     )
@@ -97,18 +97,45 @@ async def _set_guest_count(page, guests: int) -> bool:
             pass
         await page.wait_for_timeout(500)
 
-    if confirmed:
-        print(f"Solo guest selector: confirmed 1 room / {guests} guest{'s' if guests != 1 else ''}")
-    else:
+    if not confirmed:
         print(f"Solo guest selector: occupancy did not confirm {guests} guest(s)")
-    return confirmed
+        return False
+
+    print(f"Solo guest selector: confirmed 1 room / {guests} guest{'s' if guests != 1 else ''}")
+
+    # Princess updates the occupancy summary but often leaves the existing fare
+    # component cached. Reload the itinerary after the new occupancy has been
+    # saved so the pricing API is initialised again using the 1-adult state.
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1800)
+        await base.dismiss_noise(page)
+    except Exception as exc:
+        print(f"Solo guest selector: reload after guest change failed: {exc}")
+        return False
+
+    persisted = False
+    for _ in range(16):
+        try:
+            body = " ".join((await page.locator("body").inner_text()).split())
+            if re.search(rf"1\s*room\s*/\s*{guests}\s*guests?", body, re.I):
+                persisted = True
+                break
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+
+    if persisted:
+        print(f"Solo guest selector: {guests}-guest occupancy persisted after reload")
+    else:
+        print(f"Solo guest selector: {guests}-guest occupancy did not persist after reload")
+    return persisted
 
 
 # base.scrape_detail calls wait_for_cabin_prices twice on each page: first for the
-# default 2-person fares, then again after switching to 1 guest. Princess leaves
-# the old 2-person prices visible briefly while its pricing API refreshes. Track
-# the first set of cabin prices and require the second call to change before it
-# is accepted as a solo fare.
+# default 2-person fares, then again after switching to 1 guest. Keep the first
+# cabin-price set and only accept the second when Princess returns a genuinely
+# different quote.
 _original_wait_for_cabin_prices = base.wait_for_cabin_prices
 _first_prices_by_page: dict[int, dict] = {}
 
@@ -123,7 +150,10 @@ async def _wait_for_fresh_cabin_prices(page, timeout_seconds: int = 20) -> str:
 
     original = _first_prices_by_page[key]
     last_body = ""
-    for _ in range(timeout_seconds * 2):
+    # Give the reloaded solo pricing request a longer window than the normal
+    # detail-page load. Princess fare responses can be slow on GitHub runners.
+    loops = max(timeout_seconds, 30) * 2
+    for _ in range(loops):
         try:
             last_body = " ".join((await page.locator("body").inner_text()).split())
             current = base.cabin_prices(last_body)
@@ -139,8 +169,6 @@ async def _wait_for_fresh_cabin_prices(page, timeout_seconds: int = 20) -> str:
             pass
         await page.wait_for_timeout(500)
 
-    # Do not copy the 2-person fares into the solo fields if Princess did not
-    # return a distinct solo quote within the timeout.
     print("Solo fare refresh: no changed fare received; leaving solo pricing unavailable")
     return ""
 
