@@ -32,7 +32,7 @@ def main():
             r["plus_addon_per_night"] = None
             r["premier_addon_per_night"] = None
         elif line == "Carnival Cruise Line":
-            r["fare_basis"] = "Carnival Fare (best of Standard / 55+)"
+            r["fare_basis"] = "Carnival bookable fare (best available incl. 55+)"
             r["plus_addon_per_night"] = None
             r["premier_addon_per_night"] = None
         else:
