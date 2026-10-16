@@ -59,26 +59,48 @@ async def _find_sailing(request):
     raise RuntimeError("Target Carnival sailing not found")
 
 
+async def _click_continue(page, stage: str):
+    for selector in (
+        "button:has-text('CONTINUE')",
+        "button:has-text('Continue')",
+        "button:has-text('Next')",
+        "button:has-text('View Rates')",
+    ):
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible(timeout=1200):
+                await btn.click()
+                print(f"CARNIVAL_BOOKING_CLICK stage={stage} selector={selector}")
+                await page.wait_for_timeout(7000)
+                return True
+        except Exception:
+            pass
+    print(f"CARNIVAL_BOOKING_NO_CONTINUE stage={stage}")
+    return False
+
+
 async def _probe_booking(browser, sailing_url: str):
     page = await browser.new_page(locale="en-AU")
     captured = []
 
     async def on_response(response):
         try:
-            if len(captured) >= 40:
+            if len(captured) >= 80:
                 return
             parsed = urlparse(response.url)
             if not parsed.netloc.endswith("carnival.com.au"):
                 return
             low = response.url.lower()
-            if not any(k in low for k in ("booking", "/api/", "room", "rate", "price", "fare", "stateroom", "category")):
+            if any(x in low for x in (".css", ".js", ".svg", ".woff", ".png", ".jpg", "componentresources")):
+                return
+            if not any(k in low for k in ("booking-api", "cruisesearch/api", "/api/", "room", "rate", "price", "fare", "stateroom", "category", "offer")):
                 return
             content_type = (response.headers.get("content-type") or "").lower()
             item = {"status": response.status, "url": response.url, "content_type": content_type}
             if "json" in content_type:
                 try:
                     text = await response.text()
-                    item["body"] = " ".join(text.split())[:12000]
+                    item["body"] = " ".join(text.split())[:18000]
                 except Exception as exc:
                     item["body_error"] = f"{type(exc).__name__}: {exc}"
             captured.append(item)
@@ -90,28 +112,42 @@ async def _probe_booking(browser, sailing_url: str):
     print(f"CARNIVAL_BOOKING_OPEN {url}")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     print(f"CARNIVAL_BOOKING_STATUS {response.status if response else 'none'} final={page.url}")
-    await page.wait_for_timeout(10000)
+    await page.wait_for_timeout(7000)
 
-    # Continue through the rate qualifier screen if it is present, without using VIFP.
+    # Rooms/Guests -> Rate Qualifiers.
+    await _click_continue(page, "rooms-guests")
+
+    # Apply the same eligible 55+ qualifier the tracker is intended to use.
+    senior_applied = False
     for selector in (
-        "button:has-text('Continue')",
-        "button:has-text('Next')",
-        "button:has-text('View Rates')",
+        "label:has-text('55+ years old')",
+        "text=55+ years old",
     ):
         try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=700):
-                await btn.click()
-                print(f"CARNIVAL_BOOKING_CLICK {selector}")
-                await page.wait_for_timeout(8000)
+            loc = page.locator(selector).first
+            if await loc.is_visible(timeout=1200):
+                await loc.click()
+                senior_applied = True
+                print("CARNIVAL_BOOKING_55_PLUS_APPLIED")
                 break
         except Exception:
             pass
+    if not senior_applied:
+        print("CARNIVAL_BOOKING_55_PLUS_NOT_FOUND")
+
+    # Rate Qualifiers -> Room Category.
+    await _click_continue(page, "rate-qualifiers")
 
     body = " ".join((await page.locator("body").inner_text(timeout=5000)).split())
-    print(f"CARNIVAL_BOOKING_BODY {body[:9000]}")
+    print(f"CARNIVAL_BOOKING_FINAL_URL {page.url}")
+    print(f"CARNIVAL_BOOKING_BODY {body[:12000]}")
 
+    seen = set()
     for item in captured:
+        key = (item.get("status"), item.get("url"), item.get("body", "")[:200])
+        if key in seen:
+            continue
+        seen.add(key)
         print("CARNIVAL_BOOKING_RESPONSE " + json.dumps(item, separators=(",", ":")))
 
     await page.close()
