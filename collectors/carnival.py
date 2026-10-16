@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 SEARCH_API = "https://www.carnival.com.au/cruisesearch/api/search"
 BOOK_API = "https://www.carnival.com.au/booking-api/api/v1.0/book"
+INITIAL_DATA_API = "https://www.carnival.com.au/booking-api/api/v1.0/initialdata/"
 PORTS = ("SYD", "BNE", "MEL")
 PAGE_SIZE = 50
-BOOKING_CONCURRENCY = 6
 
 CABIN_CODES = {
     "IS": "interior",
@@ -186,64 +185,103 @@ def _booking_prices(body: dict, guests: int) -> dict[str, float | None]:
     return out
 
 
-async def _booking_price_set(request, semaphore: asyncio.Semaphore, *, sailing: dict, itin: dict, guests: int) -> dict[str, float | None]:
-    payload = _payload(sailing=sailing, itin=itin, guests=guests)
-    sail_id = sailing.get("sailingId")
-    sail_date = (sailing.get("departureDate") or "")[:10]
-    headers = {
-        **_headers(),
-        "accept": "application/json",
-        "content-type": "application/json",
-        "referer": "https://www.carnival.com.au/booking/qualifiers",
-    }
-
-    async with semaphore:
-        for attempt in range(1, 3):
-            try:
-                response = await request.post(BOOK_API, data=payload, headers=headers, timeout=30000)
-                if response.status != 200:
-                    print(
-                        f"Carnival booking HTTP {response.status} sailing={sail_id} date={sail_date} "
-                        f"guests={guests} attempt={attempt}/2"
-                    )
-                    if attempt < 2:
-                        await asyncio.sleep(1.0)
-                        continue
-                    raise RuntimeError(
-                        f"Carnival booking API failed for sailing {sail_id} {sail_date}, guests={guests}: HTTP {response.status}"
-                    )
-
-                body = await response.json()
-                prices = _booking_prices(body, guests)
-                if not any(v is not None for v in prices.values()):
-                    raise RuntimeError(
-                        f"Carnival booking API returned no cabin prices for sailing {sail_id} {sail_date}, guests={guests}"
-                    )
-                return prices
-            except PlaywrightTimeoutError:
-                print(
-                    f"Carnival booking timeout sailing={sail_id} date={sail_date} "
-                    f"guests={guests} attempt={attempt}/2"
-                )
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                raise
-            except Exception:
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                raise
-
-    raise RuntimeError(f"Carnival booking API exhausted retries for sailing {sail_id} {sail_date}, guests={guests}")
-
-
 def _absolute_url(path: str | None) -> str:
     if not path:
         return "https://www.carnival.com.au/cruise-search"
     if path.startswith("http://") or path.startswith("https://"):
         return path
     return "https://www.carnival.com.au" + (path if path.startswith("/") else "/" + path)
+
+
+def _session_url(sailing: dict, guests: int) -> str:
+    url = _absolute_url(sailing.get("sailingURL"))
+    if "numGuests=" in url:
+        import re
+        url = re.sub(r"numGuests=\d+", f"numGuests={guests}", url)
+    if "isOver55=N" in url:
+        url = url.replace("isOver55=N", "isOver55=Y")
+    return url
+
+
+async def _initialise_booking_session(request, *, sailing: dict, itin: dict, guests: int) -> str:
+    sail_id = sailing.get("sailingId")
+    ship_code = (itin.get("shipCode") or "").strip()
+    booking_url = _session_url(sailing, guests)
+
+    response = await request.get(booking_url, headers=_headers(), timeout=30000)
+    if response.status not in (200, 301, 302):
+        raise RuntimeError(
+            f"Carnival booking session init failed for sailing {sail_id}, guests={guests}: HTTP {response.status}"
+        )
+
+    initial = await request.get(
+        INITIAL_DATA_API,
+        params={"sailingID": str(sail_id), "shipCode": ship_code},
+        headers={**_headers(), "referer": booking_url},
+        timeout=30000,
+    )
+    if initial.status != 200:
+        raise RuntimeError(
+            f"Carnival initialdata failed for sailing {sail_id}, guests={guests}: HTTP {initial.status}"
+        )
+    return booking_url
+
+
+async def _booking_price_set(request, *, sailing: dict, itin: dict, guests: int) -> dict[str, float | None]:
+    payload = _payload(sailing=sailing, itin=itin, guests=guests)
+    sail_id = sailing.get("sailingId")
+    sail_date = (sailing.get("departureDate") or "")[:10]
+
+    for attempt in range(1, 4):
+        try:
+            booking_url = await _initialise_booking_session(request, sailing=sailing, itin=itin, guests=guests)
+            headers = {
+                **_headers(),
+                "accept": "application/json",
+                "content-type": "application/json",
+                "referer": booking_url.replace("/booking?", "/booking/qualifiers?"),
+            }
+            response = await request.post(BOOK_API, data=payload, headers=headers, timeout=30000)
+            if response.status != 200:
+                body = ""
+                try:
+                    body = " ".join((await response.text()).split())[:500]
+                except Exception:
+                    pass
+                print(
+                    f"Carnival booking HTTP {response.status} sailing={sail_id} date={sail_date} "
+                    f"guests={guests} attempt={attempt}/3 body={body}"
+                )
+                if attempt < 3:
+                    await asyncio.sleep(2.0 * attempt)
+                    continue
+                raise RuntimeError(
+                    f"Carnival booking API failed for sailing {sail_id} {sail_date}, guests={guests}: HTTP {response.status}"
+                )
+
+            body = await response.json()
+            prices = _booking_prices(body, guests)
+            if not any(v is not None for v in prices.values()):
+                raise RuntimeError(
+                    f"Carnival booking API returned no cabin prices for sailing {sail_id} {sail_date}, guests={guests}"
+                )
+            return prices
+        except PlaywrightTimeoutError:
+            print(
+                f"Carnival booking timeout sailing={sail_id} date={sail_date} "
+                f"guests={guests} attempt={attempt}/3"
+            )
+            if attempt < 3:
+                await asyncio.sleep(2.0 * attempt)
+                continue
+            raise
+        except Exception:
+            if attempt < 3:
+                await asyncio.sleep(2.0 * attempt)
+                continue
+            raise
+
+    raise RuntimeError(f"Carnival booking API exhausted retries for sailing {sail_id} {sail_date}, guests={guests}")
 
 
 def _itinerary_text(itin: dict) -> str:
@@ -266,7 +304,6 @@ async def collect(headless: bool = True) -> list[dict]:
     del headless
     async with async_playwright() as p:
         request = await p.request.new_context(extra_http_headers=_headers())
-        semaphore = asyncio.Semaphore(BOOKING_CONCURRENCY)
 
         records: dict[str, dict] = {}
         priced_solo = 0
@@ -283,17 +320,21 @@ async def collect(headless: bool = True) -> list[dict]:
             catalogue = dict(two_catalogue)
             catalogue.update(one_catalogue)
             keys = sorted(catalogue)
+            results = []
 
-            async def price_one(key: str):
+            for index, key in enumerate(keys, start=1):
                 code = key.split(":", 1)[0]
                 itin = all_itins.get(code) or {}
                 sailing = catalogue[key]
-                solo_task = _booking_price_set(request, semaphore, sailing=sailing, itin=itin, guests=1)
-                double_task = _booking_price_set(request, semaphore, sailing=sailing, itin=itin, guests=2)
-                solo, double = await asyncio.gather(solo_task, double_task)
-                return key, itin, sailing, solo, double
 
-            results = await asyncio.gather(*(price_one(key) for key in keys))
+                solo = await _booking_price_set(request, sailing=sailing, itin=itin, guests=1)
+                await asyncio.sleep(0.15)
+                double = await _booking_price_set(request, sailing=sailing, itin=itin, guests=2)
+                results.append((key, itin, sailing, solo, double))
+
+                if index % 20 == 0 or index == len(keys):
+                    print(f"Carnival booking pricing port={port}: {index}/{len(keys)} sailings")
+                await asyncio.sleep(0.15)
 
             for key, itin, source, solo, double in results:
                 code = key.split(":", 1)[0]
