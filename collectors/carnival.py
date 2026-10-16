@@ -125,7 +125,7 @@ def _payload(*, sailing: dict, itin: dict, guests: int) -> dict:
                     "numberOfGuests": guests,
                     "countryOfResidency": "AU",
                     "isMilitary": False,
-                    "isSenior": True,
+                    "isSenior": False,
                     "isPastGuest": False,
                     "pastGuestNumber": None,
                     "stateOfResidency": None,
@@ -202,8 +202,8 @@ def _session_url(sailing: dict, guests: int) -> str:
     if "numGuests=" in url:
         import re
         url = re.sub(r"numGuests=\d+", f"numGuests={guests}", url)
-    if "isOver55=N" in url:
-        url = url.replace("isOver55=N", "isOver55=Y")
+    if "isOver55=Y" in url:
+        url = url.replace("isOver55=Y", "isOver55=N")
     return url
 
 
@@ -307,8 +307,8 @@ def _itinerary_text(itin: dict) -> str:
 
 def _booking_url(itin: dict, sailing: dict) -> str:
     url = sailing.get("sailingURL") or itin.get("itineraryURLWithSailing") or itin.get("itineraryURL")
-    if url and "isOver55=N" in url:
-        url = url.replace("isOver55=N", "isOver55=Y")
+    if url and "isOver55=Y" in url:
+        url = url.replace("isOver55=Y", "isOver55=N")
     return _absolute_url(url)
 
 
@@ -375,7 +375,7 @@ async def collect(headless: bool = True) -> list[dict]:
                     "url": _booking_url(itin, source),
                     "available": any(v is not None for v in solo.values()) or any(v is not None for v in double.values()),
                     "currency": "AUD",
-                    "fare_basis": "Carnival bookable fare (best available incl. 55+)",
+                    "fare_basis": "Carnival bookable fare",
                     "one_guest_price": solo.get("interior"),
                     "two_guest_pp_price": double.get("interior"),
                     "two_guest_total": double.get("interior") * 2 if double.get("interior") is not None else None,
