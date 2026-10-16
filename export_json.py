@@ -17,14 +17,22 @@ def main():
         current = p2 if p2 is not None else p1
         prev = r.get("prev_price")
         r["price_change"] = round(current - prev, 2) if current is not None and prev is not None else None
-        r["fare_basis"] = "Princess Standard"
-        r["plus_addon_per_night"] = 79
-        r["premier_addon_per_night"] = 129
+
+        if r.get("line") == "Princess":
+            r["fare_basis"] = "Princess Standard"
+            r["plus_addon_per_night"] = 79
+            r["premier_addon_per_night"] = 129
+        else:
+            r["fare_basis"] = "Royal Caribbean Fare"
+            r["plus_addon_per_night"] = None
+            r["premier_addon_per_night"] = None
+
         r["history"] = history_for(r["cruise_id"])
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"Wrote {len(rows)} cruises to {OUT}")
+
 
 if __name__ == "__main__":
     main()
