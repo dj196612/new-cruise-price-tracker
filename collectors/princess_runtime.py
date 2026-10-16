@@ -344,26 +344,64 @@ def _solo_payload(template_payload: dict) -> dict:
     return payload
 
 
-async def _post_pricing(context, headers: dict, payload: dict, path_code: str) -> dict | None:
-    response = await context.request.post(
-        PRICING_PREFIX + path_code,
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=30000,
-    )
-    if response.status != 200:
-        print(f"Solo API {path_code}: HTTP {response.status}")
-        return None
-    return json.loads(await response.text())
+class _PricingSession:
+    """Captured Princess pricing headers, refreshed once when they start returning 403.
+
+    The captured request carries a short-lived session token; long runs began
+    getting HTTP 403 part-way through, so re-capture from a fresh page load.
+    """
+
+    def __init__(self, context, seed_url: str, headers: dict, template: dict):
+        self.context = context
+        self.seed_url = seed_url
+        self.headers = headers
+        self.template = template
+        self.generation = 0
+        self.refreshes = 0
+        self._lock = asyncio.Lock()
+
+    async def refresh(self, seen_generation: int) -> bool:
+        async with self._lock:
+            if self.generation != seen_generation:
+                return True  # another request already refreshed it
+            if self.refreshes >= 5:
+                return False
+            try:
+                self.headers, self.template = await _capture_pricing_session(self.context, self.seed_url)
+            except Exception as exc:
+                print(f"Solo API session refresh failed: {exc}")
+                return False
+            self.generation += 1
+            self.refreshes += 1
+            print(f"Solo API session refreshed after HTTP 403 (refresh {self.refreshes})")
+            return True
 
 
-async def _fetch_one_solo(context, headers: dict, template_payload: dict, record: dict, semaphore: asyncio.Semaphore):
+async def _post_pricing(session: "_PricingSession", payload: dict, path_code: str) -> dict | None:
+    for attempt in (1, 2):
+        generation = session.generation
+        response = await session.context.request.post(
+            PRICING_PREFIX + path_code,
+            headers=session.headers,
+            data=json.dumps(payload),
+            timeout=30000,
+        )
+        if response.status == 403 and attempt == 1 and await session.refresh(generation):
+            continue
+        if response.status != 200:
+            print(f"Solo API {path_code}: HTTP {response.status}")
+            return None
+        return json.loads(await response.text())
+    return None
+
+
+async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: asyncio.Semaphore):
     code = _voyage_code(record)
     if not code or record.get("two_guest_interior_pp") is None:
         return
 
     async with semaphore:
-        payload = _solo_payload(template_payload)
+        payload = _solo_payload(session.template)
         try:
             # Segment / combined voyages (A714B, 1735A ...) may only be priced
             # under the parent code, so retry with it and pick the exact cruise.
@@ -374,7 +412,7 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
 
             prices, statuses, cruises, seen = None, Counter(), [], []
             for path_code in attempts:
-                data = await _post_pricing(context, headers, payload, path_code)
+                data = await _post_pricing(session, payload, path_code)
                 if not data:
                     continue
                 cruises, seen = _matching_cruises(data, code)
@@ -390,7 +428,8 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
                 print(f"Solo API {code}: no matching cruise in response; ids returned={seen[:12]}")
                 return
             if not prices or not any(v is not None for v in prices.values()):
-                print(f"Solo API {code}: no bookable {SOLO_FARE_TYPE} solo fare; category statuses={dict(statuses)}")
+                fare_types = sorted({(f.get("fareType") or "?") for c in cruises for f in ((c.get("pricing") or {}).get("fares") or [])})
+                print(f"Solo API {code}: no bookable {SOLO_FARE_TYPE} solo fare; category statuses={dict(statuses)}; fare types offered={fare_types}")
                 return
 
             for cabin in base.CABINS:
@@ -437,9 +476,10 @@ async def _populate_solo_prices(records: list[dict], headless: bool):
 
         await context.route(base.LOCALE_URL, force_locale)
         headers, template_payload = await _capture_pricing_session(context, seed_url)
-        semaphore = asyncio.Semaphore(6)
+        session = _PricingSession(context, seed_url, headers, template_payload)
+        semaphore = asyncio.Semaphore(4)
         await asyncio.gather(*(
-            _fetch_one_solo(context, headers, template_payload, record, semaphore)
+            _fetch_one_solo(session, record, semaphore)
             for record in priced
         ))
         await browser.close()

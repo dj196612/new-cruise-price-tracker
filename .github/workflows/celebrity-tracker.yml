@@ -48,10 +48,21 @@ jobs:
           if grep -q "solo empty" run.log; then echo "::notice title=Celebrity empty solo reasons ($(grep -c "solo empty" run.log) sailings)::$(grep "solo empty" run.log | head -n 8 | enc)"; fi
 
       - name: Commit updated cruise data
+        shell: bash
         run: |
           git config user.name "cruise-tracker-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/cruises.db data/latest.json
-          git diff --cached --quiet || git commit -m "Update Celebrity cruise prices"
-          git pull --rebase origin main
-          git push
+          git diff --cached --quiet && { echo "No data changes"; exit 0; }
+          git commit -m "Update Celebrity cruise prices"
+          out=""
+          for attempt in 1 2 3; do
+            if out=$( { git pull --rebase origin main && git push origin HEAD:main; } 2>&1 ); then
+              echo "$out"; exit 0
+            fi
+            echo "$out"
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 15))
+          done
+          echo "::error title=Data commit failed after 3 attempts::$(echo "$out" | tail -n 25 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          exit 1
