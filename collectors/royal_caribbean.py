@@ -69,7 +69,7 @@ async def _search(request):
         "operationName": "cruiseSearch_Cruises",
         "variables": {
             "filters": "{}",
-            "sort": {"by": "DATE"},
+            "sort": {"by": "RECOMMENDED"},
             "pagination": {"count": 250, "skip": 0},
         },
         "query": QUERY,
