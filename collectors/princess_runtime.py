@@ -76,32 +76,30 @@ def _summarise(data: dict) -> dict:
     return out
 
 
-async def _api_post(page, payload: dict) -> dict:
-    result = await page.evaluate(
-        """async ({url, payload}) => {
-            const response = await fetch(url, {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                    'content-type': 'application/json',
-                    'accept': 'application/json, text/plain, */*'
-                },
-                body: JSON.stringify(payload)
-            });
-            const text = await response.text();
-            return {status: response.status, text};
-        }""",
-        {"url": PRICING_URL, "payload": payload},
+async def _api_post(context, headers: dict, payload: dict) -> dict:
+    replay_headers = dict(headers)
+    for key in [
+        "content-length", "host", ":authority", ":method", ":path", ":scheme",
+        "accept-encoding", "cookie",
+    ]:
+        replay_headers.pop(key, None)
+
+    response = await context.request.post(
+        PRICING_URL,
+        headers=replay_headers,
+        data=json.dumps(payload),
+        timeout=30000,
     )
-    print("SOLO_API_STATUS", result["status"])
-    if result["status"] != 200:
-        print("SOLO_API_ERROR_BODY", result["text"][:6000])
+    text = await response.text()
+    print("SOLO_API_STATUS", response.status)
+    if response.status != 200:
+        print("SOLO_API_ERROR_BODY", text[:6000])
         return {}
-    return json.loads(result["text"])
+    return json.loads(text)
 
 
 async def collect(headless: bool = True):
-    print("Running direct Princess one-guest pricing API diagnostic for A716A")
+    print("Running Princess one-guest pricing replay diagnostic for A716A")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -125,23 +123,47 @@ async def collect(headless: bool = True):
 
         await context.route(base.LOCALE_URL, force_locale)
         page = await context.new_page()
+
+        captured = {"headers": None, "post": None}
+
+        async def capture_request(request):
+            if request.url == PRICING_URL and request.method == "POST" and captured["headers"] is None:
+                captured["headers"] = await request.all_headers()
+                captured["post"] = request.post_data
+                safe = {
+                    k: v for k, v in captured["headers"].items()
+                    if k.lower() not in {"cookie", "authorization"}
+                }
+                print("SOLO_API_CAPTURED_HEADERS", json.dumps(safe, sort_keys=True)[:12000])
+                print("SOLO_API_CAPTURED_POST", (captured["post"] or "")[:8000])
+
+        page.on("request", capture_request)
+
         await page.goto(TEST_URL, wait_until="domcontentloaded", timeout=90000)
         await base.dismiss_noise(page)
         body = await base.wait_for_cabin_prices(page, 25)
         print("SOLO_API_VISIBLE_2P", json.dumps(base.cabin_prices(body), sort_keys=True))
 
-        two_bestvalue = await _api_post(page, _payload(2, "BESTVALUE"))
+        for _ in range(20):
+            if captured["headers"]:
+                break
+            await page.wait_for_timeout(250)
+
+        if not captured["headers"]:
+            raise RuntimeError("Could not capture Princess pricing request headers")
+
+        two_bestvalue = await _api_post(context, captured["headers"], _payload(2, "BESTVALUE"))
         print("SOLO_API_2P_BESTVALUE", json.dumps(_summarise(two_bestvalue), sort_keys=True)[:20000])
 
-        one_bestvalue = await _api_post(page, _payload(1, "BESTVALUE"))
+        one_bestvalue = await _api_post(context, captured["headers"], _payload(1, "BESTVALUE"))
         print("SOLO_API_1P_BESTVALUE", json.dumps(_summarise(one_bestvalue), sort_keys=True)[:20000])
 
-        one_bestfare = await _api_post(page, _payload(1, "BESTFARE"))
+        one_bestfare = await _api_post(context, captured["headers"], _payload(1, "BESTFARE"))
         print("SOLO_API_1P_BESTFARE", json.dumps(_summarise(one_bestfare), sort_keys=True)[:20000])
 
         await page.close()
         await browser.close()
 
     raise RuntimeError(
-        "Princess one-guest API diagnostic complete. Inspect SOLO_API_1P_BESTVALUE and SOLO_API_1P_BESTFARE."
+        "Princess one-guest replay diagnostic complete. Inspect SOLO_API_1P_BESTVALUE and SOLO_API_1P_BESTFARE."
     )
