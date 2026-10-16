@@ -185,6 +185,10 @@ def _booking_prices(body: dict, guests: int) -> dict[str, float | None]:
     return out
 
 
+def _empty_prices() -> dict[str, float | None]:
+    return {"interior": None, "oceanview": None, "balcony": None, "suite": None}
+
+
 def _absolute_url(path: str | None) -> str:
     if not path:
         return "https://www.carnival.com.au/cruise-search"
@@ -252,6 +256,12 @@ async def _booking_price_set(request, *, sailing: dict, itin: dict, guests: int)
                     f"Carnival booking HTTP {response.status} sailing={sail_id} date={sail_date} "
                     f"guests={guests} attempt={attempt}/3 body={body}"
                 )
+                if response.status == 409 and '"code":"BookSoldOut"' in body:
+                    print(
+                        f"Carnival booking unavailable sailing={sail_id} date={sail_date} guests={guests}; "
+                        "continuing without prices for this guest combination"
+                    )
+                    return _empty_prices()
                 if attempt < 3:
                     await asyncio.sleep(2.0 * attempt)
                     continue
@@ -262,9 +272,11 @@ async def _booking_price_set(request, *, sailing: dict, itin: dict, guests: int)
             body = await response.json()
             prices = _booking_prices(body, guests)
             if not any(v is not None for v in prices.values()):
-                raise RuntimeError(
-                    f"Carnival booking API returned no cabin prices for sailing {sail_id} {sail_date}, guests={guests}"
+                print(
+                    f"Carnival booking returned no available cabin prices sailing={sail_id} "
+                    f"date={sail_date} guests={guests}"
                 )
+                return _empty_prices()
             return prices
         except PlaywrightTimeoutError:
             print(
