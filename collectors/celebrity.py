@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from urllib.parse import urlencode
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 GRAPH_URL = "https://www.celebritycruises.com/graph"
 ROOM_URL = "https://www.celebritycruises.com/itinerary/api/v1/sailings"
 PORTS = ("SYD",)
+PAGE_SIZE = 250
 
 QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $sort: CruiseSearchSort, $pagination: CruiseSearchPagination) {
   cruiseSearch(filters: $filters, qualifiers: $qualifiers, sort: $sort, pagination: $pagination) {
@@ -33,7 +36,7 @@ QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $so
 }"""
 
 
-def _headers() -> dict[str, str]:
+def _catalogue_headers() -> dict[str, str]:
     return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -78,57 +81,68 @@ def _room_summary(sailing: dict) -> dict:
         if not mapped:
             continue
         pricing = room.get("pricing") or {}
+        amount = pricing.get("amount")
+        total = pricing.get("total")
+        if amount is None and total is None:
+            continue
         out[mapped] = {
-            "per_person": pricing.get("amount"),
-            "total": pricing.get("total"),
+            "per_person": amount,
+            "total": total,
             "category": room.get("categoryCode"),
         }
     return out
 
 
-async def _search(request):
+async def _catalogue_page(request, skip: int) -> tuple[int, list[dict]]:
     payload = {
         "operationName": "cruiseSearch_Cruises",
         "variables": {
             "filters": "{}",
             "sort": {"by": "RECOMMENDED"},
-            "pagination": {"count": 250, "skip": 0},
+            "pagination": {"count": PAGE_SIZE, "skip": skip},
         },
         "query": QUERY,
     }
     response = await request.post(
         GRAPH_URL,
-        headers=_headers(),
+        headers=_catalogue_headers(),
         data=json.dumps(payload),
         timeout=30000,
     )
-    text = await response.text()
-    print(f"CELEB_GRAPH_STATUS {response.status}")
-    try:
-        data = json.loads(text)
-    except Exception:
-        print(f"CELEB_GRAPH_NON_JSON {' '.join(text.split())[:2000]}")
-        return []
-    if data.get("errors"):
-        print(f"CELEB_GRAPH_ERRORS {json.dumps(data['errors'])[:4000]}")
-        return []
+    if response.status != 200:
+        raise RuntimeError(f"Celebrity catalogue HTTP {response.status} at skip={skip}")
+    body = await response.json()
+    if body.get("errors"):
+        raise RuntimeError(f"Celebrity catalogue GraphQL errors: {body['errors']}")
+    results = (((body.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
+    return int(results.get("total") or 0), results.get("cruises") or []
 
-    results = (((data.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
-    cruises = results.get("cruises") or []
-    local = []
-    for cruise in cruises:
-        itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-        dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
-        if dep in PORTS:
-            local.append(cruise)
-    print(
-        f"CELEB_GRAPH_TOTAL {results.get('total')} "
-        f"CELEB_GRAPH_CRUISES {len(cruises)} CELEB_LOCAL_CRUISES {len(local)}"
-    )
+
+async def _search_all(request) -> list[dict]:
+    total = None
+    skip = 0
+    local: list[dict] = []
+    while total is None or skip < total:
+        page_total, cruises = await _catalogue_page(request, skip)
+        if total is None:
+            total = page_total
+            print(f"Celebrity catalogue total: {total}")
+        if not cruises:
+            break
+        for cruise in cruises:
+            itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
+            dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
+            if dep in PORTS:
+                local.append(cruise)
+        print(
+            f"Celebrity catalogue page skip={skip}: {len(cruises)} groups, "
+            f"Sydney groups so far={len(local)}"
+        )
+        skip += len(cruises)
     return local
 
 
-async def _price(request, sailing: dict, adults: int):
+async def _price(request, sailing: dict, adults: int) -> dict | None:
     package = _package_code(sailing)
     sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
     if not package or not sail_date:
@@ -144,58 +158,97 @@ async def _price(request, sailing: dict, adults: int):
         "languageCode": "en",
         "officeCode": "SYD",
     }
-    response = await request.get(
-        ROOM_URL,
-        params=params,
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-AU,en;q=0.9",
-            "referer": "https://www.celebritycruises.com/au/cruises",
-        },
-        timeout=30000,
-    )
-    text = await response.text()
-    print(f"CELEB_PRICE_STATUS adults={adults} package={package} date={sail_date} status={response.status}")
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en-AU,en;q=0.9",
+        "referer": "https://www.celebritycruises.com/au/cruises",
+    }
+
+    response = None
+    for attempt in range(1, 3):
+        try:
+            response = await request.get(
+                ROOM_URL,
+                params=params,
+                headers=headers,
+                timeout=30000,
+            )
+            break
+        except PlaywrightTimeoutError:
+            print(
+                f"Celebrity price timeout attempt={attempt}/2 adults={adults} "
+                f"package={package} date={sail_date}"
+            )
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            print(
+                f"Celebrity price request error adults={adults} package={package} "
+                f"date={sail_date}: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+    if response is None:
+        print(
+            f"Celebrity price skipped after retries: adults={adults} "
+            f"package={package} date={sail_date}"
+        )
+        return None
+    if response.status == 404:
+        return None
+    if response.status != 200:
+        print(
+            f"Celebrity price HTTP {response.status}: adults={adults} "
+            f"package={package} date={sail_date}"
+        )
+        return None
     try:
-        body = json.loads(text)
+        body = await response.json()
     except Exception:
-        print(f"CELEB_PRICE_NON_JSON adults={adults} {' '.join(text.split())[:2000]}")
         return None
 
     target_id = f"{package}_{sail_date}"
-    returned = body.get("sailings") or []
     exact = next(
         (
-            s for s in returned
+            s for s in (body.get("sailings") or [])
             if s.get("id") == target_id
-            or (s.get("packageCode") == package and (s.get("sailDate") or s.get("startDate")) == sail_date)
+            or (
+                s.get("packageCode") == package
+                and (s.get("sailDate") or s.get("startDate")) == sail_date
+            )
         ),
         None,
     )
-    if exact is None:
-        alternatives = [
-            {
-                "id": s.get("id"),
-                "packageCode": s.get("packageCode"),
-                "sailDate": s.get("sailDate") or s.get("startDate"),
-            }
-            for s in returned[:10]
-        ]
-        print(
-            f"CELEB_PRICE_NO_EXACT_MATCH adults={adults} package={package} date={sail_date} "
-            + json.dumps(alternatives, separators=(",", ":"))
-        )
+    return _room_summary(exact) if exact else None
+
+
+def _au_url(cruise: dict, sailing: dict) -> str:
+    product = (cruise.get("productViewLink") or "").lstrip("/")
+    path = product.split("?", 1)[0]
+    if path.startswith("au/"):
+        path = path[3:]
+    package = _package_code(sailing) or ""
+    sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
+    query = urlencode({
+        "sailDate": sail_date,
+        "packageCode": package,
+        "groupId": cruise.get("id") or "",
+        "country": "AUS",
+        "currency": "AUD",
+    })
+    if path:
+        return f"https://www.celebritycruises.com/au/{path}?{query}"
+    return "https://www.celebritycruises.com/au/cruises"
+
+
+def _price_value(summary: dict | None, cabin: str, field: str) -> float | None:
+    if not summary:
         return None
-
-    summary = _room_summary(exact)
-    print(
-        f"CELEB_PRICE_EXACT_MATCH adults={adults} package={package} date={sail_date} "
-        + json.dumps(summary, separators=(",", ":"))
-    )
-    return summary
+    value = (summary.get(cabin) or {}).get(field)
+    return float(value) if isinstance(value, (int, float)) else None
 
 
-async def diagnostic(headless: bool = True):
+async def collect(headless: bool = True) -> list[dict]:
     del headless
     async with async_playwright() as p:
         request = await p.request.new_context(
@@ -203,42 +256,82 @@ async def diagnostic(headless: bool = True):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
             }
         )
-        cruises = await _search(request)
-        sample = None
+        cruises = await _search_all(request)
+        records: dict[str, dict] = {}
+        priced_double = 0
+        priced_solo = 0
+
         for cruise in cruises:
             itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-            sailings = cruise.get("sailings") or []
-            if not sailings:
+            dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
+            if dep != "SYD":
                 continue
-            print(
-                "CELEB_SAMPLE_CRUISE "
-                + json.dumps({
-                    "id": cruise.get("id"),
+
+            for sailing in cruise.get("sailings") or []:
+                package = _package_code(sailing)
+                sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
+                if not package or not sail_date:
+                    continue
+
+                solo = await _price(request, sailing, 1)
+                double = await _price(request, sailing, 2)
+                if solo:
+                    priced_solo += 1
+                if double:
+                    priced_double += 1
+
+                cruise_id = f"Celebrity:{package}:{sail_date}"
+                one_interior = (
+                    _price_value(solo, "interior", "total")
+                    or _price_value(solo, "interior", "per_person")
+                )
+                two_interior_pp = _price_value(double, "interior", "per_person")
+                two_interior_total = _price_value(double, "interior", "total")
+
+                records[cruise_id] = {
+                    "cruise_id": cruise_id,
+                    "line": "Celebrity Cruises",
                     "name": itinerary.get("name"),
                     "ship": (itinerary.get("ship") or {}).get("name"),
-                    "departure": (itinerary.get("departurePort") or {}).get("name"),
-                    "departureCode": (itinerary.get("departurePort") or {}).get("code"),
+                    "departure_port": "SYD",
+                    "arrival_port": None,
+                    "departure_date": sail_date,
                     "nights": itinerary.get("totalNights"),
-                    "sailing": sailings[0],
-                }, separators=(",", ":"))
-            )
-            sample = sailings[0]
-            break
+                    "itinerary": (itinerary.get("destination") or {}).get("name"),
+                    "url": _au_url(cruise, sailing),
+                    "available": bool(solo or double),
+                    "currency": "AUD",
+                    "one_guest_price": one_interior,
+                    "two_guest_pp_price": two_interior_pp,
+                    "two_guest_total": two_interior_total,
+                    "one_guest_interior": one_interior,
+                    "one_guest_oceanview": _price_value(solo, "oceanview", "total") or _price_value(solo, "oceanview", "per_person"),
+                    "one_guest_balcony": _price_value(solo, "balcony", "total") or _price_value(solo, "balcony", "per_person"),
+                    "one_guest_mini_suite": None,
+                    "one_guest_suite": _price_value(solo, "suite", "total") or _price_value(solo, "suite", "per_person"),
+                    "two_guest_interior_pp": two_interior_pp,
+                    "two_guest_oceanview_pp": _price_value(double, "oceanview", "per_person"),
+                    "two_guest_balcony_pp": _price_value(double, "balcony", "per_person"),
+                    "two_guest_mini_suite_pp": None,
+                    "two_guest_suite_pp": _price_value(double, "suite", "per_person"),
+                }
+                print(
+                    f"Celebrity {sail_date} SYD {itinerary.get('name')} | "
+                    f"solo={'yes' if solo else 'no'} double={'yes' if double else 'no'}"
+                )
 
-        if sample:
-            solo = await _price(request, sample, 1)
-            double = await _price(request, sample, 2)
-            print(
-                "CELEB_OCCUPANCY_RESULT "
-                + json.dumps({"solo_available": solo is not None, "double_available": double is not None})
-            )
-        else:
-            print("CELEB_NO_SAMPLE_SAILING")
         await request.dispose()
 
-
-async def collect(headless: bool = True):
-    await diagnostic(headless=headless)
-    raise RuntimeError(
-        "Celebrity Cruises API diagnostic complete. Inspect CELEB_* lines before publication."
+    out = sorted(
+        records.values(),
+        key=lambda r: (r.get("departure_date") or "", r.get("name") or ""),
     )
+    if not out:
+        raise RuntimeError("Celebrity collector returned no Sydney sailings")
+    if priced_double == 0:
+        raise RuntimeError("Celebrity collector obtained no exact 2-adult AUD pricing")
+    print(
+        f"Celebrity production result: {len(out)} sailings, "
+        f"{priced_double} with 2-adult pricing, {priced_solo} with solo pricing"
+    )
+    return out
