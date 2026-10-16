@@ -1,146 +1,171 @@
 from __future__ import annotations
 
 import json
-import re
-from urllib.parse import urlsplit
+import uuid
 
 from playwright.async_api import async_playwright
 
-SOLO_URL = "https://www.royalcaribbean.com/aus/en/cruises?search=adults:1|children:0|departurePort:BNE,SYD&country=AUS&market=aus&language=en"
-DOUBLE_URL = "https://www.royalcaribbean.com/aus/en/cruises?search=adults:2|children:0|departurePort:BNE,SYD&country=AUS&market=aus&language=en"
+GRAPH_URL = "https://www.royalcaribbean.com/graph"
+ROOM_URL = "https://www.royalcaribbean.com/itinerary/api/v1/sailings"
+PORTS = ("BNE", "SYD")
+
+QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $sort: CruiseSearchSort, $pagination: CruiseSearchPagination) {
+  cruiseSearch(filters: $filters, qualifiers: $qualifiers, sort: $sort, pagination: $pagination) {
+    results {
+      total
+      cruises {
+        id
+        productViewLink
+        masterSailing {
+          itinerary {
+            name
+            code
+            totalNights
+            departurePort { code name countryCode }
+            destination { code name }
+            ship { code name }
+          }
+        }
+        sailings { id sailDate startDate endDate bookingLink itinerary { code } }
+      }
+    }
+  }
+}"""
 
 
-def _interesting(url: str) -> bool:
-    u = (url or "").lower()
-    return any(token in u for token in (
-        "cruise", "sailing", "search", "price", "pricing", "fare", "itinerary",
-        "product", "package", "voyage", "departure", "ship", "stateroom",
-    ))
+def _headers() -> dict[str, str]:
+    return {
+        "accept": "*/*",
+        "accept-language": "en-AU,en;q=0.9",
+        "adrum": "isAjax:true",
+        "apollographql-client-name": "cruise-search-widget",
+        "app-name": "graph",
+        "brand": "R",
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "country": "AUS",
+        "countryalpha2code": "AU",
+        "currency": "AUD",
+        "language": "en",
+        "office": "SYD",
+        "pragma": "no-cache",
+        "request-timeout": "20",
+        "referer": "https://www.royalcaribbean.com/aus/en/cruises",
+        "x-session-id": str(uuid.uuid4()),
+    }
 
 
-async def _probe(url: str, label: str, headless: bool = True):
-    print(f"RC_DIAG_BEGIN {label} {url}")
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            locale="en-AU",
-            timezone_id="Australia/Sydney",
-            viewport={"width": 1440, "height": 1200},
-            extra_http_headers={"Accept-Language": "en-AU,en;q=0.9"},
-        )
-        page = await context.new_page()
-        seen = set()
+def _package_code(sailing_id: str | None) -> str | None:
+    if not sailing_id or "_" not in sailing_id:
+        return None
+    prefix, suffix = sailing_id.rsplit("_", 1)
+    if len(suffix) == 10 and suffix[4] == "-" and suffix[7] == "-":
+        return prefix
+    return None
 
-        async def on_request(request):
-            if not _interesting(request.url):
-                return
-            key = (request.method, request.url, request.post_data or "")
-            if key in seen:
-                return
-            seen.add(key)
-            post = re.sub(r"\s+", " ", request.post_data or "")[:1600]
-            print(f"RC_REQ {label} {request.method} {request.url}")
-            if post:
-                print(f"RC_REQ_BODY {label} {post}")
 
-        async def on_response(response):
-            if not _interesting(response.url):
-                return
-            ctype = (response.headers or {}).get("content-type", "")
-            if "json" not in ctype.lower():
-                return
-            try:
-                text = await response.text()
-            except Exception:
-                return
-            flat = re.sub(r"\s+", " ", text)
-            print(f"RC_RESP {label} {response.status} {response.url}")
-            print(f"RC_RESP_JSON {label} {flat[:2400]}")
+async def _search(request):
+    payload = {
+        "operationName": "cruiseSearch_Cruises",
+        "variables": {
+            "filters": json.dumps({"departurePort": list(PORTS)}, separators=(",", ":")),
+            "sort": {"by": "PRICE"},
+            "pagination": {"count": 100, "skip": 0},
+        },
+        "query": QUERY,
+    }
+    response = await request.post(GRAPH_URL, headers=_headers(), data=json.dumps(payload), timeout=30000)
+    text = await response.text()
+    print(f"RC_GRAPH_STATUS {response.status}")
+    print(f"RC_GRAPH_BODY {' '.join(text.split())[:12000]}")
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if data.get("errors"):
+        print(f"RC_GRAPH_ERRORS {json.dumps(data['errors'])[:4000]}")
+        return []
+    results = (((data.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
+    cruises = results.get("cruises") or []
+    print(f"RC_GRAPH_TOTAL {results.get('total')} RC_GRAPH_CRUISES {len(cruises)}")
+    return cruises
 
-        page.on("request", on_request)
-        page.on("response", on_response)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_timeout(12000)
+async def _price(request, sailing: dict, adults: int):
+    sailing_id = sailing.get("id")
+    package = _package_code(sailing_id)
+    sail_date = sailing.get("sailDate") or sailing.get("startDate")
+    if not package or not sail_date:
+        print(f"RC_PRICE_SKIP adults={adults} sailing_id={sailing_id} sail_date={sail_date}")
+        return
 
-        # Best-effort cookie dismissal.
-        for name in ("Accept All Cookies", "Accept Cookies", "Accept", "I Agree"):
-            try:
-                button = page.get_by_role("button", name=re.compile(name, re.I))
-                if await button.count() and await button.first.is_visible():
-                    await button.first.click(timeout=1200)
-                    break
-            except Exception:
-                pass
-
-        # Trigger lazy loading/virtualised result lists.
-        for _ in range(5):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1200)
-
-        body = " ".join((await page.locator("body").inner_text()).split())
-        print(f"RC_PAGE_URL {label} {page.url}")
-        print(f"RC_TITLE {label} {await page.title()}")
-        print(f"RC_BODY {label} {body[:5000]}")
-
-        hrefs = await page.locator("a[href]").evaluate_all(
-            "els => els.map(e => e.href).filter(Boolean)"
-        )
-        cruise_links = []
-        for href in hrefs:
-            h = href.lower()
-            if any(k in h for k in ("cruise", "sailing", "itinerary", "booking")):
-                if href not in cruise_links:
-                    cruise_links.append(href)
-        print(f"RC_LINK_COUNT {label} {len(cruise_links)}")
-        for href in cruise_links[:80]:
-            print(f"RC_LINK {label} {href}")
-
-        # Show visible text for likely result cards/containers.
-        candidates = page.locator("article, [class*='card'], [class*='sailing'], [class*='cruise'], [data-testid]")
-        printed = 0
-        for i in range(min(await candidates.count(), 200)):
-            item = candidates.nth(i)
-            try:
-                if not await item.is_visible():
-                    continue
-                text = " ".join((await item.inner_text(timeout=500)).split())
-                if len(text) < 40:
-                    continue
-                if not re.search(r"\$|AUD|night|day|Sydney|Brisbane", text, re.I):
-                    continue
-                print(f"RC_CARD {label} {text[:1600]}")
-                printed += 1
-                if printed >= 20:
-                    break
-            except Exception:
-                pass
-
-        cookies = await context.cookies()
-        for c in cookies:
-            name = (c.get("name") or "").lower()
-            if any(k in name for k in ("country", "market", "locale", "currency", "geo", "region")):
-                print(f"RC_COOKIE {label} {c.get('name')}={c.get('value')} domain={c.get('domain')}")
-
-        try:
-            local_storage = await page.evaluate("Object.fromEntries(Object.entries(localStorage))")
-            session_storage = await page.evaluate("Object.fromEntries(Object.entries(sessionStorage))")
-            print(f"RC_LOCAL_STORAGE {label} {json.dumps(local_storage)[:3000]}")
-            print(f"RC_SESSION_STORAGE {label} {json.dumps(session_storage)[:3000]}")
-        except Exception as exc:
-            print(f"RC_STORAGE_ERROR {label} {exc}")
-
-        await browser.close()
-        print(f"RC_DIAG_END {label}")
+    params = {
+        "packageCode": package,
+        "sailDate": sail_date[:10],
+        "adults": str(adults),
+        "children": "0",
+        "countryCode": "AUS",
+        "currencyCode": "AUD",
+        "languageCode": "en",
+        "officeCode": "SYD",
+    }
+    response = await request.get(
+        ROOM_URL,
+        params=params,
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-AU,en;q=0.9",
+            "referer": "https://www.royalcaribbean.com/aus/en/cruises",
+        },
+        timeout=30000,
+    )
+    text = await response.text()
+    print(f"RC_PRICE_STATUS adults={adults} package={package} date={sail_date[:10]} status={response.status}")
+    print(f"RC_PRICE_BODY adults={adults} {' '.join(text.split())[:12000]}")
 
 
 async def diagnostic(headless: bool = True):
-    await _probe(SOLO_URL, "SOLO", headless=headless)
-    await _probe(DOUBLE_URL, "DOUBLE", headless=headless)
+    del headless
+    async with async_playwright() as p:
+        request = await p.request.new_context(
+            extra_http_headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
+            }
+        )
+        cruises = await _search(request)
+        sample = None
+        for cruise in cruises:
+            it = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
+            dep = ((it.get("departurePort") or {}).get("code") or "").upper()
+            if dep not in PORTS:
+                continue
+            sailings = cruise.get("sailings") or []
+            if not sailings:
+                continue
+            print(
+                "RC_SAMPLE_CRUISE "
+                + json.dumps({
+                    "id": cruise.get("id"),
+                    "name": it.get("name"),
+                    "ship": (it.get("ship") or {}).get("name"),
+                    "departure": (it.get("departurePort") or {}).get("name"),
+                    "nights": it.get("totalNights"),
+                    "sailing": sailings[0],
+                }, separators=(",", ":"))
+            )
+            sample = sailings[0]
+            break
+
+        if sample:
+            await _price(request, sample, 1)
+            await _price(request, sample, 2)
+        else:
+            print("RC_NO_SAMPLE_SAILING")
+        await request.dispose()
 
 
 async def collect(headless: bool = True):
     await diagnostic(headless=headless)
     raise RuntimeError(
-        "Royal Caribbean diagnostic complete. Inspect RC_* lines before enabling publication."
+        "Royal Caribbean API diagnostic complete. Inspect RC_GRAPH_* and RC_PRICE_* lines before enabling publication."
     )
