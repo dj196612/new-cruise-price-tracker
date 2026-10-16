@@ -5,6 +5,7 @@ const pct = v => v == null ? "—" : `${v.toFixed(1)}%`;
 const cabinLabels = {interior:"Interior",oceanview:"Oceanview",balcony:"Balcony",mini_suite:"Mini-Suite",suite:"Suite"};
 const portNames = {SYD:"Sydney",BNE:"Brisbane",MEL:"Melbourne"};
 
+function selectedLines(){ return [...document.querySelectorAll("#cruiseLines input:checked")].map(x=>x.value); }
 function selectedPorts(){ return [...document.querySelectorAll("#ports input:checked")].map(x=>x.value); }
 function departurePortName(c){ return portNames[c.departure_port] || c.departure_port; }
 function cabin(){ return $("#cabin").value; }
@@ -40,6 +41,7 @@ function soloPremium(c){
   return one!=null&&two!=null?((one/two)-1)*100:null;
 }
 function passes(c){
+  if(!selectedLines().includes(c.line)) return false;
   if(!selectedPorts().includes(departurePortName(c))) return false;
   if(!isPrincess(c) && $("#farePackage").value!=="standard") return false;
   if(c.nights && c.nights < (+$("#minNights").value||0)) return false;
@@ -122,6 +124,7 @@ window.showHistory=function(id){
   $("#historyDialog").showModal();
 }
 function reset(){
+  document.querySelectorAll("#cruiseLines input").forEach(x=>x.checked=true);
   document.querySelectorAll("#ports input").forEach(x=>x.checked=true);
   $("#passengers").value="2"; $("#cabin").value="interior"; $("#farePackage").value="standard";
   $("#minNights").value=1; $("#maxNights").value=""; $("#dateFrom").value=""; $("#dateTo").value=""; $("#maxPrice").value="";
