@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import async_playwright
@@ -34,6 +36,75 @@ def _voyage_code(record: dict) -> str | None:
         return values[0] if values else None
     except Exception:
         return None
+
+
+def _parse_date_value(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    m = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
+    if m:
+        try:
+            return datetime.strptime(m.group(0), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+
+    m = re.search(r"\b(20\d{2})(\d{2})(\d{2})\b", text)
+    if m:
+        try:
+            return datetime.strptime(m.group(0), "%Y%m%d").date().isoformat()
+        except ValueError:
+            pass
+
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+    ):
+        try:
+            return datetime.strptime(text[:26], fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_departure_date(data: dict) -> str | None:
+    """Find the voyage start/departure/sail date in Princess pricing data."""
+    preferred = (
+        "departuredate", "departdate", "saildate", "startdate",
+        "cruisestartdate", "voyagestartdate", "embarkdate",
+    )
+    fallback = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_norm = re.sub(r"[^a-z]", "", str(key).lower())
+                if isinstance(child, str):
+                    parsed = _parse_date_value(child)
+                    if parsed:
+                        if any(token in key_norm for token in preferred):
+                            return parsed
+                        if "date" in key_norm:
+                            fallback.append(parsed)
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found:
+                    return found
+        return None
+
+    found = walk(data)
+    return found or (fallback[0] if fallback else None)
 
 
 def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, float | None]:
@@ -155,6 +226,13 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
             for cabin in base.CABINS:
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
+
+            if not record.get("departure_date"):
+                api_date = _extract_departure_date(data)
+                if api_date:
+                    record["departure_date"] = api_date
+                    record["cruise_id"] = base.make_id(code, api_date)
+                    print(f"Princess date {code}: {api_date}")
 
             print(
                 f"Solo API {code}: Interior {prices.get('interior')} | "
