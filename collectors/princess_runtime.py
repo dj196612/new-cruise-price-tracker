@@ -38,6 +38,45 @@ def _voyage_code(record: dict) -> str | None:
         return None
 
 
+_DATE_KEYS = ("saildate", "departuredate", "embarkdate", "embarkationdate", "startdate", "departdate")
+
+
+def _to_iso(value) -> str | None:
+    raw = str(value or "")
+    m = re.match(r"^(20\d{2})-?(\d{2})-?(\d{2})", raw)
+    if not m:
+        return None
+    y, mo, d = (int(x) for x in m.groups())
+    if not (2026 <= y <= 2035 and 1 <= mo <= 12 and 1 <= d <= 31):
+        return None
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _find_voyage_date(obj, code: str, depth: int = 0) -> str | None:
+    """Walk a Princess JSON feed for the object describing this voyage code and return its sail date."""
+    if depth > 12:
+        return None
+    if isinstance(obj, dict):
+        ids = {str(obj.get(k)).strip().upper() for k in ("cruiseId", "voyageCode", "voyageId", "productId", "id", "code") if obj.get(k)}
+        if code.upper() in ids:
+            for key, value in obj.items():
+                if key.lower() in _DATE_KEYS:
+                    iso = _to_iso(value)
+                    if iso:
+                        return iso
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                found = _find_voyage_date(value, code, depth + 1)
+                if found:
+                    return found
+    elif isinstance(obj, list):
+        for value in obj[:2000]:
+            found = _find_voyage_date(value, code, depth + 1)
+            if found:
+                return found
+    return None
+
+
 async def _voyage_header_text(page, h1_text: str, body: str) -> str:
     """Return text local to the current itinerary title, not the whole Princess page."""
     best = h1_text or ""
@@ -80,6 +119,19 @@ async def _scrape_detail_fixed(context, item: dict, semaphore: asyncio.Semaphore
     """Princess detail scraper with voyage-local ship/date extraction."""
     async with semaphore:
         page = await context.new_page()
+        feed_dates: list[str] = []
+
+        async def sniff_date(resp):
+            if feed_dates or "princess.com" not in resp.url or "json" not in (resp.headers.get("content-type") or ""):
+                return
+            try:
+                found = _find_voyage_date(await resp.json(), item["voyage_code"])
+            except Exception:
+                return
+            if found:
+                feed_dates.append(found)
+
+        page.on("response", sniff_date)
         try:
             url = base.au_detail_url(item["url"])
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -105,6 +157,13 @@ async def _scrape_detail_fixed(context, item: dict, semaphore: asyncio.Semaphore
 
             header_text = await _voyage_header_text(page, h1_text, body)
             departure_date = base.parse_date(header_text)
+            if not departure_date:
+                await page.wait_for_timeout(300)
+                if feed_dates:
+                    departure_date = feed_dates[0]
+                    print(f"Date for {item['voyage_code']} taken from Princess data feed: {departure_date}")
+                else:
+                    print(f"Date missing for {item['voyage_code']}: not in page header or data feeds")
             ship_match = base.SHIP_RE.search(header_text)
             ship = ship_match.group(0) if ship_match else None
             dep = item.get("departure_port") or base.departure_port(header_text) or base.departure_port(body)
@@ -338,7 +397,7 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
             if not record.get("departure_date"):
-                api_date = _sail_date(cruises)
+                api_date = _sail_date(cruises) or _find_voyage_date(data, code)
                 if api_date:
                     record["departure_date"] = api_date
                     record["cruise_id"] = base.make_id(code, api_date)
