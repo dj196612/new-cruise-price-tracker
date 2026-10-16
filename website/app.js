@@ -3,8 +3,10 @@ const $ = s => document.querySelector(s);
 const money = (v,currency="AUD") => v == null ? "—" : new Intl.NumberFormat("en-AU",{style:"currency",currency:currency||"AUD",maximumFractionDigits:0}).format(v);
 const pct = v => v == null ? "—" : `${v.toFixed(1)}%`;
 const cabinLabels = {interior:"Interior",oceanview:"Oceanview",balcony:"Balcony",mini_suite:"Mini-Suite",suite:"Suite"};
+const portNames = {SYD:"Sydney",BNE:"Brisbane",MEL:"Melbourne"};
 
 function selectedPorts(){ return [...document.querySelectorAll("#ports input:checked")].map(x=>x.value); }
+function departurePortName(c){ return portNames[c.departure_port] || c.departure_port; }
 function cabin(){ return $("#cabin").value; }
 function isPrincess(c){ return c.line === "Princess"; }
 function packageAddon(c){
@@ -37,7 +39,7 @@ function soloPremium(c){
   return one!=null&&two!=null?((one/two)-1)*100:null;
 }
 function passes(c){
-  if(!selectedPorts().includes(c.departure_port)) return false;
+  if(!selectedPorts().includes(departurePortName(c))) return false;
   if(!isPrincess(c) && $("#farePackage").value!=="standard") return false;
   if(c.nights && c.nights < (+$("#minNights").value||0)) return false;
   if(c.nights && c.nights > (+$("#maxNights").value||999)) return false;
@@ -78,7 +80,7 @@ function card(c){
   return `<article class="card">
     <div>
       <h2>${c.name||"Cruise"}${titleDate}</h2>
-      <div class="meta">${c.line||"Cruise line"} · ${c.ship||"Ship TBA"} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
+      <div class="meta">${c.line||"Cruise line"} · ${c.ship||"Ship TBA"} · ${c.nights||"?"} nights · Depart ${departurePortName(c)||"?"}</div>
       <div class="route">${(c.itinerary||"").slice(0,310)}</div>
       <div class="badges"><span class="badge">${selectedAvailable?"Available":"Selected cabin unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel(c)}</span>${changeText}${lowText}</div>
     </div>
