@@ -368,8 +368,9 @@ GUEST_PLACEMENTS = {
     "filters+qualifiers": lambda n: {"filters": f"adults:{n}|children:0", "qualifiers": f"adults:{n}|children:0"},
 }
 ATTEMPTS = (
+    ("AU-no-office", "filters"),  # confirmed working for Celebrity on 17 Oct 2026
     ("AU", "filters"), ("AU", "qualifiers"), ("AU", "qualifiers-only"), ("AU", "filters+qualifiers"),
-    ("AU-no-office", "filters"), ("AU-no-office", "qualifiers"),
+    ("AU-no-office", "qualifiers"),
 )
 
 
@@ -451,15 +452,18 @@ def _verified(line: str, solo, double, label: str) -> dict:
 
 # --------------------------------------------------------------------- main
 
-async def fetch_solo_prices(line: str, headless: bool = True) -> dict[tuple[str, str], dict[str, float]]:
-    """Return {(PACKAGECODE, 'YYYY-MM-DD'): {cabin: AUD solo price}}; empty on any failure."""
+async def fetch_solo_prices(line: str, headless: bool = True):
+    """Return (solo, double) maps of {(PACKAGECODE, 'YYYY-MM-DD'): {cabin: price}}; ({}, {}) on failure.
+
+    `double` is the 2-adult per-person price, used by the caller to confirm the
+    currency matches the AUD itinerary prices before trusting `solo`."""
     try:
         async with async_playwright() as p:
             # 1) Direct query to the graph endpoint.
             solo, double = await _direct(p, line)
             result = _verified(line, solo, double, "direct")
             if result:
-                return result
+                return result, double
 
             # 2) Fallback: capture the AU search page's own request and replay it.
             browser = await p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
@@ -472,7 +476,7 @@ async def fetch_solo_prices(line: str, headless: bool = True) -> dict[tuple[str,
             try:
                 captured = await _capture(context, line)
                 if not captured:
-                    return {}
+                    return {}, {}
                 method, url, headers, template = captured
                 solo_payload, rewrote = _set_adults(template, 1)
                 double_payload, _ = _set_adults(template, 2)
@@ -481,7 +485,8 @@ async def fetch_solo_prices(line: str, headless: bool = True) -> dict[tuple[str,
                 double = await _run_query(context.request, method, url, headers, double_payload, line, "page 2 adults")
             finally:
                 await browser.close()
-            return _verified(line, solo, double, "page capture")
+            result = _verified(line, solo, double, "page capture")
+            return (result, double) if result else ({}, {})
     except Exception as exc:
         print(f"{line} solo graph failed: {type(exc).__name__}: {exc}")
-        return {}
+        return {}, {}

@@ -145,6 +145,25 @@ def _key(record: dict, prefix: str) -> tuple[str, str] | None:
     return parts[1].upper(), (record.get("departure_date") or parts[2])[:10]
 
 
+def _currency_matches(records: list[dict], double: dict, prefix: str, line: str) -> bool:
+    """Search 2-adult per-person prices must match the AUD itinerary prices."""
+    ratios = []
+    for r in records:
+        key = _key(r, prefix)
+        api = r.get("two_guest_interior_pp")
+        graph = (double.get(key) or {}).get("interior") if key else None
+        if api and graph:
+            ratios.append(graph / api)
+    if len(ratios) < 3:
+        print(f"{line} solo currency check: only {len(ratios)} sailings to compare; accepting search prices")
+        return True
+    ratios.sort()
+    median = ratios[len(ratios) // 2]
+    ok = 0.85 <= median <= 1.15
+    print(f"{line} solo currency check: median search/AUD 2-adult ratio {median:.3f} over {len(ratios)} sailings -> {'OK' if ok else 'REJECTED (not AUD?)'}")
+    return ok
+
+
 async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
     config = CONFIG[line]
     gaps = [r for r in records if _has_solo_gap(r)]
@@ -154,7 +173,9 @@ async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
         return records
 
     # 1) Primary source: the site's own AU cruise-search GraphQL at 1 adult.
-    graph = await fetch_solo_prices(line)
+    graph, graph_double = await fetch_solo_prices(line)
+    if graph and not _currency_matches(records, graph_double, config["prefix"], line):
+        graph = {}
     graph_rows = graph_cells = 0
     for record in gaps:
         key = _key(record, config["prefix"])
