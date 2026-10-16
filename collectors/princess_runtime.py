@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from urllib.parse import urlsplit, urlunsplit
+
 from . import princess as base
 
 
-def _valid_detail_url(url: str) -> str:
-    # Princess itinerary pages use the global /itinerary-details route.
-    # The previous /en-au/itinerary-details form returns a 404.
-    return base.canonical_url(url)
+def _australian_detail_url(url: str) -> str:
+    """Route Princess itinerary pages through the Australian market host."""
+    parts = urlsplit(base.canonical_url(url))
+    path = parts.path
+    if not path.startswith("/en-au/"):
+        path = "/en-au" + (path if path.startswith("/") else "/" + path)
+    return urlunsplit(("https", "au-www.princess.com", path, parts.query, ""))
 
 
-# Patch only the broken detail-URL transformation while keeping the
-# already-working 93-cruise catalogue discovery logic intact.
-base.au_detail_url = _valid_detail_url
+# Catalogue discovery stays on the known-working www.princess.com search page.
+# Only itinerary detail requests are routed through Princess's Australian host.
+base.au_detail_url = _australian_detail_url
 
 
 async def collect(headless: bool = True):
