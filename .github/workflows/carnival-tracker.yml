@@ -33,11 +33,11 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run Carnival diagnostic
+      - name: Run Carnival member diagnostic
         shell: bash
         run: |
           set -o pipefail
-          python run_carnival.py 2>&1 | tee carnival-diagnostic.txt
+          python run_carnival_member_diagnostic.py 2>&1 | tee carnival-diagnostic.txt
 
       - name: Upload redacted Carnival diagnostic
         if: always()
