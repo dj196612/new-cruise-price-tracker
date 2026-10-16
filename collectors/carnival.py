@@ -1,249 +1,277 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 from urllib.parse import urlencode
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
+SEARCH_API = "https://www.carnival.com.au/cruisesearch/api/search"
 PORTS = ("SYD", "BNE", "MEL")
-BASE_SEARCH = "https://www.carnival.com.au/cruise-search"
+PAGE_SIZE = 50
 
 
-def _search_url(port: str, guests: int) -> str:
-    params = {
-        "embkCode": port,
-        "numAdults": str(guests),
-        "pageNumber": "1",
-        "pageSize": "8",
-        "showBest": "true",
-        "sort": "FromPrice",
-        "useSuggestions": "true",
+def _headers() -> dict[str, str]:
+    return {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "en-AU,en;q=0.9",
+        "referer": "https://www.carnival.com.au/cruise-search",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36",
     }
-    return BASE_SEARCH + "?" + urlencode(params)
 
 
-def _safe_url(url: str) -> str:
-    vifp = os.getenv("CARNIVAL_VIFP", "").strip()
-    return url.replace(vifp, "<CARNIVAL_VIFP>") if vifp else url
-
-
-def _safe_text(text: str) -> str:
-    vifp = os.getenv("CARNIVAL_VIFP", "").strip()
-    return text.replace(vifp, "<CARNIVAL_VIFP>") if vifp else text
-
-
-async def _capture(page, label: str):
-    captured: list[dict] = []
-
-    async def on_response(response):
+async def _get_json(request, *, port: str, guests: int, senior: bool, page: int) -> dict | None:
+    params = {
+        "pageNumber": str(page),
+        "numadults": str(guests),
+        "port": port,
+        "pagesize": str(PAGE_SIZE),
+        "sort": "FromPrice",
+        "showBest": "true",
+        "async": "true",
+        "currency": "AUD",
+        "locality": "7",
+        "client": "cruisesearch",
+        "senior": "true" if senior else "false",
+    }
+    for attempt in range(1, 3):
         try:
-            url = response.url
-            low = url.lower()
-            content_type = (response.headers.get("content-type") or "").lower()
-            if not any(k in low for k in (
-                "/api/", "price", "rate", "fare", "booking", "sailing", "cruise-search", "qualifier"
-            )):
-                return
-            item = {
-                "status": response.status,
-                "url": _safe_url(url),
-                "content_type": content_type,
-            }
-            if "json" in content_type:
-                try:
-                    text = await response.text()
-                    item["body"] = _safe_text(" ".join(text.split())[:14000])
-                except Exception as exc:
-                    item["body_error"] = f"{type(exc).__name__}: {exc}"
-            captured.append(item)
-        except Exception:
-            pass
+            response = await request.get(SEARCH_API, params=params, headers=_headers(), timeout=30000)
+            if response.status != 200:
+                print(
+                    f"Carnival search HTTP {response.status} port={port} guests={guests} "
+                    f"senior={senior} page={page} attempt={attempt}/2"
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+                    continue
+                return None
+            return await response.json()
+        except PlaywrightTimeoutError:
+            print(
+                f"Carnival search timeout port={port} guests={guests} senior={senior} "
+                f"page={page} attempt={attempt}/2"
+            )
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            print(
+                f"Carnival search error port={port} guests={guests} senior={senior} "
+                f"page={page}: {type(exc).__name__}: {exc}"
+            )
+            return None
+    return None
 
-    page.on("response", on_response)
-    return captured
+
+def _room_prices(sailing: dict) -> dict[str, float | None]:
+    out = {"interior": None, "oceanview": None, "balcony": None, "suite": None}
+    rooms = sailing.get("rooms") or {}
+    for source, target in (
+        ("interior", "interior"),
+        ("oceanview", "oceanview"),
+        ("balcony", "balcony"),
+        ("suite", "suite"),
+    ):
+        room = rooms.get(source) or {}
+        if room.get("soldOut"):
+            continue
+        if (room.get("priceCurrency") or "AUD").upper() != "AUD":
+            continue
+        value = room.get("price")
+        if isinstance(value, (int, float)):
+            out[target] = float(value)
+    return out
 
 
-async def _probe_search(browser, port: str, guests: int):
-    page = await browser.new_page(locale="en-AU")
-    captured = await _capture(page, f"search-{port}-{guests}")
-    url = _search_url(port, guests)
-    print(f"CARNIVAL_SEARCH_START port={port} guests={guests} url={url}")
-    try:
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+def _merge_lower(current: dict | None, candidate: dict, senior: bool) -> dict:
+    if current is None:
+        return {
+            "prices": _room_prices(candidate),
+            "sailing": candidate,
+            "senior_used": {k: senior for k, v in _room_prices(candidate).items() if v is not None},
+        }
+
+    cand_prices = _room_prices(candidate)
+    for cabin, cand in cand_prices.items():
+        if cand is None:
+            continue
+        cur = current["prices"].get(cabin)
+        if cur is None or cand < cur:
+            current["prices"][cabin] = cand
+            current["senior_used"][cabin] = senior
+    return current
+
+
+async def _collect_offer_set(request, *, port: str, guests: int, senior: bool) -> tuple[dict[str, dict], dict[str, dict]]:
+    sailings: dict[str, dict] = {}
+    itineraries: dict[str, dict] = {}
+    page = 1
+    last_page = 1
+
+    while page <= last_page:
+        body = await _get_json(request, port=port, guests=guests, senior=senior, page=page)
+        if not body:
+            break
+        results = body.get("results") or {}
+        last_page = int(results.get("lastPage") or 1)
+        rows = results.get("itineraries") or []
+
+        for itin in rows:
+            code = (itin.get("code") or "").strip()
+            dep = (itin.get("departurePortCode") or "").upper()
+            if not code or dep != port:
+                continue
+            itineraries[code] = itin
+            for sailing in itin.get("sailings") or []:
+                sail_id = str(sailing.get("sailingId") or "").strip()
+                sail_date = (sailing.get("departureDate") or "")[:10]
+                if not sail_id or not sail_date:
+                    continue
+                key = f"{code}:{sail_id}:{sail_date}"
+                sailings[key] = _merge_lower(sailings.get(key), sailing, senior)
+
         print(
-            f"CARNIVAL_SEARCH_STATUS port={port} guests={guests} "
-            f"status={response.status if response else 'none'} final={_safe_url(page.url)}"
+            f"Carnival port={port} guests={guests} senior={senior} page={page}/{last_page}: "
+            f"{len(rows)} itineraries, {len(sailings)} sailings"
         )
-        await page.wait_for_timeout(9000)
-    except Exception as exc:
-        print(f"CARNIVAL_SEARCH_ERROR port={port} guests={guests} {type(exc).__name__}: {exc}")
+        page += 1
 
-    try:
-        body = _safe_text(" ".join((await page.locator("body").inner_text(timeout=5000)).split()))
-        print(f"CARNIVAL_SEARCH_BODY port={port} guests={guests} {body[:7000]}")
-    except Exception as exc:
-        print(f"CARNIVAL_SEARCH_BODY_ERROR port={port} guests={guests} {type(exc).__name__}: {exc}")
-
-    seen = set()
-    for item in captured:
-        key = (item.get("status"), item.get("url"), item.get("body", "")[:200])
-        if key in seen:
-            continue
-        seen.add(key)
-        print("CARNIVAL_SEARCH_RESPONSE " + json.dumps(item, separators=(",", ":")))
-    await page.close()
+    return sailings, itineraries
 
 
-async def _probe_member_rate(browser):
-    vifp = os.getenv("CARNIVAL_VIFP", "").strip()
-    if not vifp:
-        print("CARNIVAL_MEMBER_SKIPPED missing CARNIVAL_VIFP secret")
-        return
-
-    page = await browser.new_page(locale="en-AU")
-    captured = await _capture(page, "member")
-
-    # Use a broad Brisbane 1-adult search because Carnival Encounter has frequent local sailings.
-    search_url = _search_url("BNE", 1)
-    print("CARNIVAL_MEMBER_START search=BNE guests=1")
-    try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(7000)
-
-        # Click the first visible cruise/date/book-style action we can find.
-        selectors = [
-            "a:has-text('Select')",
-            "button:has-text('Select')",
-            "a:has-text('Book')",
-            "button:has-text('Book')",
-            "a:has-text('View Dates')",
-            "button:has-text('View Dates')",
-            "a:has-text('Show')",
-            "button:has-text('Show')",
-        ]
-        clicked = False
-        for selector in selectors:
-            loc = page.locator(selector).first
-            try:
-                if await loc.is_visible(timeout=1200):
-                    await loc.click()
-                    clicked = True
-                    print(f"CARNIVAL_MEMBER_CLICK selector={selector}")
-                    break
-            except Exception:
-                pass
-        if not clicked:
-            print("CARNIVAL_MEMBER_NO_INITIAL_CTA")
-
-        await page.wait_for_timeout(7000)
-
-        # If a rate-qualifier step is present, apply the user's observed qualifiers.
-        try:
-            country = page.get_by_text("Country of Residence", exact=False).first
-            if await country.is_visible(timeout=1500):
-                print("CARNIVAL_MEMBER_RATE_QUALIFIERS_VISIBLE")
-        except Exception:
-            pass
-
-        # Tick 55+ where available.
-        for text in ("55+ years old", "55+", "55 years old"):
-            try:
-                label = page.get_by_text(text, exact=False).first
-                if await label.is_visible(timeout=700):
-                    await label.click()
-                    print("CARNIVAL_MEMBER_55_PLUS_APPLIED")
-                    break
-            except Exception:
-                pass
-
-        # Tick guest number option and fill the number without ever printing it.
-        for text in ("Add Carnival Guest #", "Carnival Guest #", "VIFP"):
-            try:
-                label = page.get_by_text(text, exact=False).first
-                if await label.is_visible(timeout=700):
-                    await label.click()
-                    break
-            except Exception:
-                pass
-
-        filled = False
-        for selector in (
-            "input[placeholder*='Carnival Guest']",
-            "input[aria-label*='Carnival Guest']",
-            "input[name*='guest']",
-            "input[id*='guest']",
-            "input[name*='vifp']",
-            "input[id*='vifp']",
-        ):
-            try:
-                inp = page.locator(selector).first
-                if await inp.is_visible(timeout=700):
-                    await inp.fill(vifp)
-                    filled = True
-                    print("CARNIVAL_MEMBER_VIFP_FILLED")
-                    break
-            except Exception:
-                pass
-        if not filled:
-            inputs = page.locator("input")
-            for i in range(min(await inputs.count(), 30)):
-                inp = inputs.nth(i)
-                try:
-                    placeholder = (await inp.get_attribute("placeholder") or "").lower()
-                    aria = (await inp.get_attribute("aria-label") or "").lower()
-                    if "guest" in placeholder or "guest" in aria or "vifp" in placeholder or "vifp" in aria:
-                        await inp.fill(vifp)
-                        filled = True
-                        print("CARNIVAL_MEMBER_VIFP_FILLED_FALLBACK")
-                        break
-                except Exception:
-                    pass
-
-        # Continue/apply if present.
-        for selector in (
-            "button:has-text('Continue')",
-            "button:has-text('Apply')",
-            "button:has-text('Next')",
-            "button:has-text('View Rates')",
-        ):
-            try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=700):
-                    await btn.click()
-                    print(f"CARNIVAL_MEMBER_APPLY selector={selector}")
-                    break
-            except Exception:
-                pass
-
-        await page.wait_for_timeout(10000)
-        body = _safe_text(" ".join((await page.locator("body").inner_text(timeout=5000)).split()))
-        print(f"CARNIVAL_MEMBER_BODY {body[:9000]}")
-    except Exception as exc:
-        print(f"CARNIVAL_MEMBER_ERROR {type(exc).__name__}: {exc}")
-
-    seen = set()
-    for item in captured:
-        key = (item.get("status"), item.get("url"), item.get("body", "")[:200])
-        if key in seen:
-            continue
-        seen.add(key)
-        print("CARNIVAL_MEMBER_RESPONSE " + json.dumps(item, separators=(",", ":")))
-    await page.close()
+def _absolute_url(path: str | None) -> str:
+    if not path:
+        return "https://www.carnival.com.au/cruise-search"
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return "https://www.carnival.com.au" + (path if path.startswith("/") else "/" + path)
 
 
-async def diagnostic(headless: bool = True):
+def _itinerary_text(itin: dict) -> str:
+    ports = [p for p in (itin.get("portsToDisplay") or []) if p]
+    if ports:
+        return " · ".join(ports)
+    schedule = ((itin.get("leadSailing") or {}).get("schedule") or [])
+    names = [x.get("port") for x in schedule if x.get("port") and "sea" not in x.get("port", "").lower()]
+    return " · ".join(names)
+
+
+def _choose_url(itin: dict, sailing: dict, guests: int, senior_flags: dict[str, bool]) -> str:
+    if any(senior_flags.values()):
+        url = sailing.get("sailingURL")
+        if url:
+            if "isOver55=N" in url:
+                url = url.replace("isOver55=N", "isOver55=Y")
+            return _absolute_url(url)
+    url = sailing.get("sailingURL") or itin.get("itineraryURLWithSailing") or itin.get("itineraryURL")
+    return _absolute_url(url)
+
+
+async def collect(headless: bool = True) -> list[dict]:
+    del headless
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        request = await p.request.new_context(extra_http_headers=_headers())
+
+        records: dict[str, dict] = {}
+        priced_solo = 0
+        priced_double = 0
+
         for port in PORTS:
-            for guests in (1, 2):
-                await _probe_search(browser, port, guests)
-                await asyncio.sleep(0.5)
-        await _probe_member_rate(browser)
-        await browser.close()
+            one_std, one_itins = await _collect_offer_set(request, port=port, guests=1, senior=False)
+            one_sen, one_sen_itins = await _collect_offer_set(request, port=port, guests=1, senior=True)
+            two_std, two_itins = await _collect_offer_set(request, port=port, guests=2, senior=False)
+            two_sen, two_sen_itins = await _collect_offer_set(request, port=port, guests=2, senior=True)
 
+            one = one_std
+            for key, row in one_sen.items():
+                if key not in one:
+                    one[key] = row
+                else:
+                    for cabin, value in row["prices"].items():
+                        cur = one[key]["prices"].get(cabin)
+                        if value is not None and (cur is None or value < cur):
+                            one[key]["prices"][cabin] = value
+                            one[key]["senior_used"][cabin] = True
 
-async def collect(headless: bool = True):
-    await diagnostic(headless=headless)
-    raise RuntimeError("Carnival diagnostic complete. Inspect CARNIVAL_* lines before publication.")
+            two = two_std
+            for key, row in two_sen.items():
+                if key not in two:
+                    two[key] = row
+                else:
+                    for cabin, value in row["prices"].items():
+                        cur = two[key]["prices"].get(cabin)
+                        if value is not None and (cur is None or value < cur):
+                            two[key]["prices"][cabin] = value
+                            two[key]["senior_used"][cabin] = True
+
+            all_itins = {}
+            all_itins.update(one_itins)
+            all_itins.update(one_sen_itins)
+            all_itins.update(two_itins)
+            all_itins.update(two_sen_itins)
+
+            keys = sorted(set(one) | set(two))
+            for key in keys:
+                code = key.split(":", 1)[0]
+                itin = all_itins.get(code) or {}
+                solo_row = one.get(key)
+                double_row = two.get(key)
+                source = (double_row or solo_row or {}).get("sailing") or {}
+                sail_date = (source.get("departureDate") or "")[:10]
+                if not sail_date:
+                    continue
+
+                solo = (solo_row or {}).get("prices") or {"interior": None, "oceanview": None, "balcony": None, "suite": None}
+                double = (double_row or {}).get("prices") or {"interior": None, "oceanview": None, "balcony": None, "suite": None}
+                if any(v is not None for v in solo.values()):
+                    priced_solo += 1
+                if any(v is not None for v in double.values()):
+                    priced_double += 1
+
+                sailing_id = str(source.get("sailingId") or "")
+                cruise_id = f"Carnival:{code}:{sailing_id}:{sail_date}"
+                senior_flags = {}
+                senior_flags.update((solo_row or {}).get("senior_used") or {})
+                senior_flags.update((double_row or {}).get("senior_used") or {})
+
+                records[cruise_id] = {
+                    "cruise_id": cruise_id,
+                    "line": "Carnival Cruise Line",
+                    "name": itin.get("itineraryTitleFormatted") or itin.get("itineraryTitle") or "Carnival Cruise",
+                    "ship": itin.get("shipName"),
+                    "departure_port": port,
+                    "arrival_port": None,
+                    "departure_date": sail_date,
+                    "nights": itin.get("dur"),
+                    "itinerary": _itinerary_text(itin),
+                    "url": _choose_url(itin, source, 2, senior_flags),
+                    "available": any(v is not None for v in solo.values()) or any(v is not None for v in double.values()),
+                    "currency": "AUD",
+                    "fare_basis": "Carnival Fare (best of Standard / 55+)",
+                    "one_guest_price": solo.get("interior"),
+                    "two_guest_pp_price": double.get("interior"),
+                    "two_guest_total": double.get("interior") * 2 if double.get("interior") is not None else None,
+                    "one_guest_interior": solo.get("interior"),
+                    "one_guest_oceanview": solo.get("oceanview"),
+                    "one_guest_balcony": solo.get("balcony"),
+                    "one_guest_mini_suite": None,
+                    "one_guest_suite": solo.get("suite"),
+                    "two_guest_interior_pp": double.get("interior"),
+                    "two_guest_oceanview_pp": double.get("oceanview"),
+                    "two_guest_balcony_pp": double.get("balcony"),
+                    "two_guest_mini_suite_pp": None,
+                    "two_guest_suite_pp": double.get("suite"),
+                }
+
+        await request.dispose()
+
+    out = sorted(records.values(), key=lambda r: (r.get("departure_date") or "", r.get("departure_port") or "", r.get("name") or ""))
+    if not out:
+        raise RuntimeError("Carnival collector returned no Australian sailings")
+    if priced_double == 0:
+        raise RuntimeError("Carnival collector obtained no 2-guest AUD pricing")
+
+    print(
+        f"Carnival production result: {len(out)} sailings, "
+        f"{priced_double} with 2-guest pricing, {priced_solo} with solo pricing"
+    )
+    return out
