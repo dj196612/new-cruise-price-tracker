@@ -195,6 +195,8 @@ async def _price(request, sailing: dict, adults: int) -> dict | None:
         )
         return None
     if response.status == 404:
+        if adults == 1:
+            print(f"Celebrity solo empty: package={package} date={sail_date}: HTTP 404 (no 1-adult availability returned)")
         return None
     if response.status != 200:
         print(
