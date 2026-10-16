@@ -96,14 +96,50 @@ async def dismiss_noise(page: Page):
             pass
 
 
-async def select_standard(page: Page):
-    # Princess search often defaults to Plus. Force Standard before opening the catalogue.
-    label = await first_visible(page.get_by_text(re.compile(r"^Princess Standard$", re.I)))
-    if label is None:
-        raise RuntimeError("Princess Standard fare option was not found")
-    await label.click(timeout=3000)
-    await page.wait_for_timeout(900)
-    print("Princess Standard fare selected.")
+async def select_standard(page: Page) -> bool:
+    """Best-effort Standard selection; never abort if Princess hides the control."""
+    # Accessible radio/label variants first.
+    candidates = [
+        page.get_by_role("radio", name=re.compile(r"Princess Standard|Standard", re.I)),
+        page.get_by_label(re.compile(r"Princess Standard|Standard", re.I)),
+        page.get_by_text(re.compile(r"Princess Standard", re.I)),
+    ]
+    for loc in candidates:
+        item = await first_visible(loc)
+        if item is None:
+            continue
+        try:
+            await item.click(timeout=3000, force=True)
+            await page.wait_for_timeout(900)
+            print("Princess Standard fare selected on search page.")
+            return True
+        except Exception:
+            continue
+
+    # Some Princess layouts render a hidden radio next to visible text.
+    try:
+        radios = page.locator('input[type="radio"]')
+        for i in range(await radios.count()):
+            radio = radios.nth(i)
+            label_text = ""
+            try:
+                rid = await radio.get_attribute("id")
+                if rid:
+                    lab = page.locator(f'label[for="{rid}"]')
+                    if await lab.count():
+                        label_text = await lab.first.inner_text()
+            except Exception:
+                pass
+            if re.search(r"standard", label_text or "", re.I):
+                await radio.check(force=True)
+                await page.wait_for_timeout(900)
+                print("Princess Standard fare selected via radio input.")
+                return True
+    except Exception:
+        pass
+
+    print("Princess Standard control not exposed on this layout; continuing because itinerary detail pages are authoritative.")
+    return False
 
 
 async def select_australian_departure_ports(page: Page) -> int:
@@ -123,7 +159,7 @@ async def select_australian_departure_ports(page: Page) -> int:
         await target.click(timeout=3000)
         await page.wait_for_timeout(300)
 
-    await select_standard(page)
+    selected_standard = await select_standard(page)
 
     view = page.locator("button", has_text=re.compile(r"VIEW\s+\d+\s+RESULTS", re.I))
     visible_view = await first_visible(view)
@@ -134,7 +170,8 @@ async def select_australian_departure_ports(page: Page) -> int:
     if not m:
         raise RuntimeError(f"Could not read Princess result count from: {label}")
     expected = int(m.group(1))
-    print(f"Princess search reports {expected} Standard-fare cruises for Sydney/Melbourne/Brisbane.")
+    fare_note = "Standard-selected" if selected_standard else "detail-page pricing"
+    print(f"Princess search reports {expected} cruises for Sydney/Melbourne/Brisbane ({fare_note}).")
     await visible_view.click(timeout=5000, force=True)
     await page.wait_for_timeout(4500)
     return expected
@@ -183,7 +220,6 @@ async def load_all_results(page: Page, expected: int) -> list[str]:
 
 
 async def set_guest_count_on_detail(page: Page, guests: int) -> bool:
-    # Native select, if Princess exposes one.
     selects = page.locator("select")
     for i in range(await selects.count()):
         sel = selects.nth(i)
