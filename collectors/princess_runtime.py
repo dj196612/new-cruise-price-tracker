@@ -17,12 +17,7 @@ async def _first_visible(locator):
 
 
 async def _set_guest_count(page, guests: int) -> bool:
-    """Set Princess detail-page occupancy.
-
-    Princess does not expose "1 room / 1 guest" as a direct option. The rooms
-    panel uses adult +/- controls, so for solo pricing we open the panel and
-    decrement Adults from 2 to 1.
-    """
+    """Set Princess detail-page occupancy to the requested guest count."""
     current = await _first_visible(
         page.get_by_text(re.compile(r"1\s*room\s*/\s*\d+\s*guests?", re.I))
     )
@@ -37,20 +32,8 @@ async def _set_guest_count(page, guests: int) -> bool:
         print(f"Solo guest selector: could not open control: {exc}")
         return False
 
-    # Some Princess variants may expose a direct occupancy choice.
-    direct = await _first_visible(
-        page.get_by_text(re.compile(rf"1\s*room\s*/\s*{guests}\s*guests?", re.I))
-    )
-    if direct is not None:
-        try:
-            await direct.click(timeout=2000, force=True)
-        except Exception:
-            pass
-
     if guests == 1:
         clicked = False
-
-        # Preferred route: accessible decrement button names.
         candidates = [
             page.get_by_role("button", name=re.compile(r"(decrease|decrement|minus|remove).*(adult|guest)", re.I)),
             page.get_by_role("button", name=re.compile(r"(adult|guest).*(decrease|decrement|minus|remove)", re.I)),
@@ -70,8 +53,6 @@ async def _set_guest_count(page, guests: int) -> bool:
             except Exception:
                 pass
 
-        # Fallback: find the Adults row and use its first enabled button,
-        # which is the minus control in Princess's rooms-and-guests panel.
         if not clicked:
             adults = await _first_visible(page.get_by_text(re.compile(r"^Adults?$", re.I)))
             if adults is not None:
@@ -96,7 +77,6 @@ async def _set_guest_count(page, guests: int) -> bool:
             print("Solo guest selector: adult decrement button not found")
             return False
 
-    # Apply/confirm if the panel requires it. Some layouts update immediately.
     for label in (r"^Apply$", r"^Done$", r"^Save$", r"^Update$", r"^Continue$"):
         button = await _first_visible(page.get_by_role("button", name=re.compile(label, re.I)))
         if button is not None:
@@ -106,10 +86,8 @@ async def _set_guest_count(page, guests: int) -> bool:
             except Exception:
                 pass
 
-    # Wait for the occupancy summary to confirm the new guest count, then give
-    # the fare component time to refresh before base.wait_for_cabin_prices runs.
     confirmed = False
-    for _ in range(12):
+    for _ in range(16):
         try:
             body = " ".join((await page.locator("body").inner_text()).split())
             if re.search(rf"1\s*room\s*/\s*{guests}\s*guests?", body, re.I):
@@ -120,19 +98,62 @@ async def _set_guest_count(page, guests: int) -> bool:
         await page.wait_for_timeout(500)
 
     if confirmed:
-        await page.wait_for_timeout(1800)
         print(f"Solo guest selector: confirmed 1 room / {guests} guest{'s' if guests != 1 else ''}")
     else:
         print(f"Solo guest selector: occupancy did not confirm {guests} guest(s)")
     return confirmed
 
 
-async def collect(headless: bool = True):
-    # Override the older direct-option guest selector with the current Princess
-    # adult decrement control without disturbing the proven AU pricing flow.
-    base.set_guest_count_on_detail = _set_guest_count
+# base.scrape_detail calls wait_for_cabin_prices twice on each page: first for the
+# default 2-person fares, then again after switching to 1 guest. Princess leaves
+# the old 2-person prices visible briefly while its pricing API refreshes. Track
+# the first set of cabin prices and require the second call to change before it
+# is accepted as a solo fare.
+_original_wait_for_cabin_prices = base.wait_for_cabin_prices
+_first_prices_by_page: dict[int, dict] = {}
 
-    records = await base.collect(headless=headless)
+
+async def _wait_for_fresh_cabin_prices(page, timeout_seconds: int = 20) -> str:
+    key = id(page)
+
+    if key not in _first_prices_by_page:
+        body = await _original_wait_for_cabin_prices(page, timeout_seconds)
+        _first_prices_by_page[key] = base.cabin_prices(body)
+        return body
+
+    original = _first_prices_by_page[key]
+    last_body = ""
+    for _ in range(timeout_seconds * 2):
+        try:
+            last_body = " ".join((await page.locator("body").inner_text()).split())
+            current = base.cabin_prices(last_body)
+            has_price = any(v is not None for v in current.values())
+            changed = any(current.get(c) != original.get(c) for c in base.CABINS)
+            if has_price and changed:
+                print(
+                    "Solo fare refresh: prices changed after switching to 1 guest "
+                    f"(Interior {original.get('interior')} -> {current.get('interior')})"
+                )
+                return last_body
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+
+    # Do not copy the 2-person fares into the solo fields if Princess did not
+    # return a distinct solo quote within the timeout.
+    print("Solo fare refresh: no changed fare received; leaving solo pricing unavailable")
+    return ""
+
+
+async def collect(headless: bool = True):
+    base.set_guest_count_on_detail = _set_guest_count
+    base.wait_for_cabin_prices = _wait_for_fresh_cabin_prices
+
+    try:
+        records = await base.collect(headless=headless)
+    finally:
+        base.wait_for_cabin_prices = _original_wait_for_cabin_prices
+        _first_prices_by_page.clear()
 
     priced = [r for r in records if r.get("two_guest_interior_pp") is not None]
     if not priced:
@@ -149,6 +170,12 @@ async def collect(headless: bool = True):
         )
 
     solo_priced = sum(1 for r in records if r.get("one_guest_interior") is not None)
-    print(f"Princess solo Interior pricing captured for {solo_priced}/{len(records)} cruises.")
+    identical = sum(
+        1 for r in records
+        if r.get("one_guest_interior") is not None
+        and r.get("two_guest_interior_pp") is not None
+        and r.get("one_guest_interior") == r.get("two_guest_interior_pp")
+    )
+    print(f"Princess solo Interior pricing captured for {solo_priced}/{len(records)} cruises; {identical} identical to 2-person pp fare.")
 
     return records
