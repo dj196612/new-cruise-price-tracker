@@ -12,6 +12,7 @@ function cabin(){ return $("#cabin").value; }
 function isPrincess(c){ return c.line === "Princess"; }
 function isCelebrity(c){ return c.line === "Celebrity Cruises"; }
 function isNcl(c){ return c.line === "Norwegian Cruise Line"; }
+function isCarnival(c){ return c.line === "Carnival Cruise Line"; }
 function packageAddon(c){
   if(!isPrincess(c)) return 0;
   const p=$("#farePackage").value;
@@ -74,6 +75,7 @@ function packageLabel(c){
     if(c.fare_basis) return c.fare_basis;
     if(isCelebrity(c)) return "Celebrity Fare";
     if(isNcl(c)) return "NCL Fare";
+    if(isCarnival(c)) return "Carnival Fare";
     return "Royal Caribbean Fare";
   }
   return {standard:"Princess Standard",plus:"Princess Plus",premier:"Princess Premier"}[$("#farePackage").value];
@@ -83,12 +85,14 @@ function lineUrl(c){
   if(isPrincess(c)) return "https://www.princess.com";
   if(isCelebrity(c)) return "https://www.celebritycruises.com/au/cruises";
   if(isNcl(c)) return "https://www.ncl.com/au/en/vacations?embPorts=SYD";
+  if(isCarnival(c)) return "https://www.carnival.com.au/cruise-search";
   return "https://www.royalcaribbean.com/aus/en/cruises";
 }
 function lineLinkLabel(c){
   if(isPrincess(c)) return "View on Princess";
   if(isCelebrity(c)) return "View on Celebrity";
   if(isNcl(c)) return "View on NCL";
+  if(isCarnival(c)) return "View on Carnival";
   return "View on Royal Caribbean";
 }
 function card(c){
