@@ -174,6 +174,26 @@ async def _apply_senior(page):
 async def _probe_booking(browser, sailing_url: str):
     page = await browser.new_page(locale="en-AU")
     captured = []
+    captured_requests = []
+
+    def on_request(request):
+        try:
+            low = request.url.lower()
+            if "/booking-api/api/v1.0/book" not in low:
+                return
+            item = {
+                "method": request.method,
+                "url": request.url,
+                "headers": {
+                    k: v
+                    for k, v in request.headers.items()
+                    if k.lower() in {"content-type", "accept", "origin", "referer"}
+                },
+                "post_data": request.post_data,
+            }
+            captured_requests.append(item)
+        except Exception as exc:
+            print(f"CARNIVAL_BOOKING_REQUEST_CAPTURE_ERROR {type(exc).__name__}: {exc}")
 
     async def on_response(response):
         try:
@@ -199,6 +219,7 @@ async def _probe_booking(browser, sailing_url: str):
         except Exception:
             pass
 
+    page.on("request", on_request)
     page.on("response", on_response)
     url = "https://www.carnival.com.au" + sailing_url if sailing_url.startswith("/") else sailing_url
     print(f"CARNIVAL_BOOKING_OPEN {url}")
@@ -215,6 +236,9 @@ async def _probe_booking(browser, sailing_url: str):
     body = " ".join((await page.locator("body").inner_text(timeout=5000)).split())
     print(f"CARNIVAL_BOOKING_FINAL_URL {page.url}")
     print(f"CARNIVAL_BOOKING_BODY {body[:14000]}")
+
+    for item in captured_requests:
+        print("CARNIVAL_BOOKING_REQUEST " + json.dumps(item, separators=(",", ":")))
 
     seen = set()
     for item in captured:
