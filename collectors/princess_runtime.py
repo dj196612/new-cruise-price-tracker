@@ -248,7 +248,67 @@ def _matching_cruises(data: dict, code: str) -> tuple[list[dict], list[str]]:
     return [], seen
 
 
-def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE) -> tuple[dict[str, float | None], Counter]:
+_CHARGE_HINTS = ("tax", "fee", "ncf", "port", "charge", "gov")
+PRICE_MODES = ("fare", "fare+charges", "avg", "avg+charges")
+_price_mode = {"value": "fare"}  # chosen by _calibrate_two_guest
+
+
+def _amount(value) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("amount", "value", "total"):
+            found = _amount(value.get(key))
+            if found is not None:
+                return found
+    return None
+
+
+def _guest_charges(guest: dict) -> float:
+    total = 0.0
+    for key, value in guest.items():
+        low = key.lower()
+        if "fare" in low or not any(h in low for h in _CHARGE_HINTS):
+            continue
+        amount = _amount(value)
+        if amount:
+            total += amount
+    return total
+
+
+def _guest_price(guests: list[dict], mode: str) -> float | None:
+    fares = [_amount(g.get("fare")) for g in guests]
+    if not fares or any(f is None for f in fares):
+        return None
+    if mode.startswith("avg"):
+        value = sum(fares) / len(fares)
+        if mode.endswith("+charges"):
+            value += sum(_guest_charges(g) for g in guests) / len(guests)
+        return value
+    first_index = next((i for i, g in enumerate(guests) if str(g.get("id")) == "1"), 0)
+    value = fares[first_index]
+    if mode.endswith("+charges"):
+        value += _guest_charges(guests[first_index])
+    return value
+
+
+def _sample_guest(cruises: list[dict]) -> str:
+    for cruise in cruises:
+        for fare in ((cruise.get("pricing") or {}).get("fares") or []):
+            for category in fare.get("categories") or []:
+                guests = category.get("guests") or []
+                if guests:
+                    cat_keys = sorted(k for k in category if k != "guests")
+                    return f"category keys={cat_keys}; guests={json.dumps(guests)[:500]}"
+    return "no guests found"
+
+
+def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE, mode: str | None = None) -> tuple[dict[str, float | None], Counter]:
     result = {c: None for c in base.CABINS}
     statuses: Counter = Counter()
 
@@ -271,11 +331,8 @@ def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE) -> 
                 guests = category.get("guests") or []
                 if not guests:
                     continue
-                first = next((g for g in guests if str(g.get("id")) == "1"), guests[0])
-                value = first.get("fare")
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
+                value = _guest_price(guests, mode or _price_mode["value"])
+                if value is None:
                     continue
                 current = result[cabin]
                 if current is None or value < current:
@@ -366,7 +423,7 @@ class _PricingSession:
         async with self._lock:
             if self.generation != seen_generation:
                 return True  # another request already refreshed it
-            if self.refreshes >= 5:
+            if self.refreshes >= 40:
                 return False
             try:
                 self.headers, self.template = await _capture_pricing_session(self.context, self.seed_url)
@@ -459,6 +516,8 @@ async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: a
             for note in notes:
                 print(f"Solo API {code}: {note}")
             if not cruises:
+                if any("HTTP 403" in n for n in notes):
+                    record["_solo_403"] = True
                 return
             if not prices or not any(v is not None for v in prices.values()):
                 fare_types = sorted({(f.get("fareType") or "?") for c in cruises for f in ((c.get("pricing") or {}).get("fares") or [])})
@@ -485,24 +544,46 @@ async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: a
 
 
 async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -> None:
-    """Only fill missing 2-guest prices from the API if it matches the page's Standard price."""
-    ratios = []
-    for record in seeded[:6]:
+    """Pick how to read API prices so they match the page's 2-guest Standard price.
+
+    The page price may include taxes/fees that the API's `fare` excludes; the
+    same reading is then used for solo prices so both sides are comparable.
+    """
+    samples = []  # (page price, cruises)
+    for record in seeded[:8]:
         code = _voyage_code(record)
         try:
-            two, *_ = await _fetch_fares(session, code, 2)
+            _, _, cruises, _, _ = await _fetch_fares(session, code, 2)
         except Exception:
             continue
-        api, page = (two or {}).get("interior"), record.get("two_guest_interior_pp")
-        if api and page:
-            ratios.append(api / page)
-    ratios.sort()
-    median = ratios[len(ratios) // 2] if ratios else None
-    session.two_guest_ok = bool(median and len(ratios) >= 3 and 0.97 <= median <= 1.03)
-    print(
-        f"Princess 2-guest API calibration: {len(ratios)} voyages, median API/page ratio "
-        f"{median if median is None else round(median, 3)} -> {'using API to fill missing 2-guest prices' if session.two_guest_ok else 'NOT filling 2-guest prices'}"
-    )
+        if cruises and record.get("two_guest_interior_pp"):
+            samples.append((record["two_guest_interior_pp"], cruises))
+    if samples:
+        print(f"Princess calibration sample: {_sample_guest(samples[0][1])}")
+
+    best = None
+    for mode in PRICE_MODES:
+        ratios = []
+        for page, cruises in samples:
+            api = _solo_cabin_prices(cruises, mode=mode)[0].get("interior")
+            if api:
+                ratios.append(api / page)
+        if len(ratios) < 3:
+            continue
+        ratios.sort()
+        median = ratios[len(ratios) // 2]
+        print(f"Princess calibration mode={mode}: median API/page ratio {median:.3f} over {len(ratios)} voyages")
+        if 0.97 <= median <= 1.03 and (best is None or abs(median - 1) < abs(best[1] - 1)):
+            best = (mode, median)
+
+    if best:
+        _price_mode["value"] = best[0]
+        session.two_guest_ok = True
+        print(f"Princess calibration: using mode={best[0]} for solo and 2-guest API prices (ratio {best[1]:.3f})")
+    else:
+        _price_mode["value"] = "fare"
+        session.two_guest_ok = False
+        print("Princess calibration: no reading matches the page price; solo uses API fare only and missing 2-guest prices are NOT filled")
 
 
 async def _populate_solo_prices(records: list[dict], headless: bool):
@@ -535,11 +616,27 @@ async def _populate_solo_prices(records: list[dict], headless: bool):
         headers, template_payload = await _capture_pricing_session(context, seed_url)
         session = _PricingSession(context, seed_url, headers, template_payload)
         await _calibrate_two_guest(session, seeded)
-        semaphore = asyncio.Semaphore(4)
+        semaphore = asyncio.Semaphore(3)
         await asyncio.gather(*(
             _fetch_one_solo(session, record, semaphore)
             for record in targets
         ))
+
+        # Second pass for voyages blocked by 403s: fresh session, one at a time.
+        retry = [r for r in targets if r.get("_solo_403")]
+        if retry:
+            print(f"Solo API second pass: {len(retry)} voyages hit HTTP 403; retrying slowly with a fresh session")
+            await asyncio.sleep(20)
+            await session.refresh(session.generation)
+            single = asyncio.Semaphore(1)
+            for record in retry:
+                record.pop("_solo_403", None)
+                await _fetch_one_solo(session, record, single)
+                await asyncio.sleep(1.5)
+            still = sum(1 for r in retry if r.get("_solo_403"))
+            print(f"Solo API second pass: {len(retry) - still}/{len(retry)} recovered")
+        for record in targets:
+            record.pop("_solo_403", None)
         await browser.close()
 
 
