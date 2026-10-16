@@ -76,8 +76,8 @@ async def _click_continue(page, stage: str):
                 print(f"CARNIVAL_BOOKING_CLICK stage={stage} text={text}")
                 await page.wait_for_timeout(7000)
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"CARNIVAL_BOOKING_CLICK_ERROR stage={stage} button={i} {type(exc).__name__}: {exc}")
     print(f"CARNIVAL_BOOKING_NO_CONTINUE stage={stage}")
     return False
 
@@ -94,7 +94,6 @@ async def _apply_senior(page):
                 print(f"CARNIVAL_BOOKING_55_PLUS_CHECKED checked={checked}")
                 return checked
 
-            # Some Carnival builds render the input adjacent to the label.
             nearby = label.locator("xpath=preceding::input[@type='checkbox'][1]")
             if await nearby.count():
                 if not await nearby.is_checked():
@@ -110,7 +109,6 @@ async def _apply_senior(page):
     except Exception as exc:
         print(f"CARNIVAL_BOOKING_55_PLUS_ERROR {type(exc).__name__}: {exc}")
 
-    # Last-resort DOM probe: find the checkbox whose surrounding text contains 55+.
     try:
         result = await page.evaluate("""
         () => {
@@ -192,11 +190,9 @@ async def main():
         request = await p.request.new_context(extra_http_headers=_headers())
         _, sailing, _ = await _find_sailing(request)
         await request.dispose()
-
         browser = await p.chromium.launch(headless=True)
         await _probe_booking(browser, sailing.get("sailingURL") or "")
         await browser.close()
-
     raise RuntimeError("Carnival booking diagnostic complete")
 
 
