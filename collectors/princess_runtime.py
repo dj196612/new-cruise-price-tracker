@@ -250,7 +250,7 @@ def _matching_cruises(data: dict, code: str) -> tuple[list[dict], list[str]]:
 
 _CHARGE_HINTS = ("tax", "fee", "ncf", "port", "charge", "gov")
 PRICE_MODES = ("fare", "fare+charges", "avg", "avg+charges")
-_price_mode = {"value": "fare"}  # chosen by _calibrate_two_guest
+_price_mode = {"value": "fare", "scale": 1.0}  # chosen by _calibrate_two_guest
 
 
 def _amount(value) -> float | None:
@@ -334,6 +334,8 @@ def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE, mod
                 value = _guest_price(guests, mode or _price_mode["value"])
                 if value is None:
                     continue
+                if mode is None:
+                    value = round(value * _price_mode["scale"], 2)
                 current = result[cabin]
                 if current is None or value < current:
                     result[cabin] = value
@@ -543,6 +545,22 @@ async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: a
             print(f"Solo API {code} failed: {exc}")
 
 
+def _currency_hints(obj, depth: int = 0, found: set | None = None) -> set:
+    found = set() if found is None else found
+    if depth > 8 or len(found) > 20:
+        return found
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if "currenc" in key.lower() and isinstance(value, (str, int, float)):
+                found.add(f"{key}={value}")
+            elif isinstance(value, (dict, list)):
+                _currency_hints(value, depth + 1, found)
+    elif isinstance(obj, list):
+        for value in obj[:20]:
+            _currency_hints(value, depth + 1, found)
+    return found
+
+
 async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -> None:
     """Pick how to read API prices so they match the page's 2-guest Standard price.
 
@@ -553,15 +571,21 @@ async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -
     for record in seeded[:8]:
         code = _voyage_code(record)
         try:
-            _, _, cruises, _, _ = await _fetch_fares(session, code, 2)
+            _, _, cruises, data, _ = await _fetch_fares(session, code, 2)
         except Exception:
             continue
         if cruises and record.get("two_guest_interior_pp"):
             samples.append((record["two_guest_interior_pp"], cruises))
+            if len(samples) == 1:
+                print(f"Princess calibration response currency fields: {sorted(_currency_hints(data))}")
     if samples:
         print(f"Princess calibration sample: {_sample_guest(samples[0][1])}")
+        req = _solo_payload(session.template, 2)
+        print(f"Princess calibration request: booking={json.dumps({k: v for k, v in req.get('booking', {}).items() if k != 'guests'})[:300]} "
+              f"other currency fields={sorted(_currency_hints({k: v for k, v in req.items() if k != 'booking'}))}")
 
     best = None
+    fare_ratios: list[float] = []
     for mode in PRICE_MODES:
         ratios = []
         for page, cruises in samples:
@@ -572,14 +596,29 @@ async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -
             continue
         ratios.sort()
         median = ratios[len(ratios) // 2]
-        print(f"Princess calibration mode={mode}: median API/page ratio {median:.3f} over {len(ratios)} voyages")
+        if mode == "fare":
+            fare_ratios = ratios
+        print(f"Princess calibration mode={mode}: median API/page ratio {median:.3f} over {len(ratios)} voyages (range {ratios[0]:.3f}-{ratios[-1]:.3f})")
         if 0.97 <= median <= 1.03 and (best is None or abs(median - 1) < abs(best[1] - 1)):
             best = (mode, median)
 
+    _price_mode["scale"] = 1.0
     if best:
         _price_mode["value"] = best[0]
         session.two_guest_ok = True
         print(f"Princess calibration: using mode={best[0]} for solo and 2-guest API prices (ratio {best[1]:.3f})")
+    elif len(fare_ratios) >= 5 and fare_ratios[-1] / fare_ratios[0] <= 1.02 and 0.4 <= fare_ratios[len(fare_ratios) // 2] <= 0.95:
+        # Every sample differs from the page by the same factor: the API is
+        # pricing in another currency. Convert to the page's AUD with the
+        # factor measured on this run.
+        median = fare_ratios[len(fare_ratios) // 2]
+        _price_mode["value"] = "fare"
+        _price_mode["scale"] = 1 / median
+        session.two_guest_ok = True
+        print(
+            f"Princess calibration: API prices are a constant {median:.3f}x the page's AUD price "
+            f"(range {fare_ratios[0]:.3f}-{fare_ratios[-1]:.3f}); converting API prices x{1 / median:.4f} to AUD"
+        )
     else:
         _price_mode["value"] = "fare"
         session.two_guest_ok = False
