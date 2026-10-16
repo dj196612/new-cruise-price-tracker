@@ -41,11 +41,11 @@ function passes(c){
   if($("#dateFrom").value && c.departure_date < $("#dateFrom").value) return false;
   if($("#dateTo").value && c.departure_date > $("#dateTo").value) return false;
   if($("#ship").value && c.ship !== $("#ship").value) return false;
-  if($("#available").checked && !c.available) return false;
+  if($("#available").checked && priceFor(c)==null) return false;
   if($("#dropped").checked && !(priceChange(c)<0)) return false;
   const max=+$("#maxPrice").value;
   if(max && (priceFor(c)==null || priceFor(c)>max)) return false;
-  return priceFor(c)!=null;
+  return true;
 }
 function sortRows(rows){
   const s=$("#sort").value;
@@ -65,20 +65,21 @@ function card(c){
   const p=priceFor(c), ppn=perNight(c), total=currentTotal(c), cur=c.currency||"AUD", low=historicalLow(c), change=priceChange(c), solo=soloPremium(c);
   const changeText = change==null?"":`<span class="badge ${change<0?"drop":"rise"}">${change<0?"↓":"↑"} ${money(Math.abs(change),cur)} since previous check</span>`;
   const lowText = p!=null&&low!=null&&p<=low ? `<span class="badge low">Historical low</span>` : "";
+  const selectedAvailable = p!=null;
   return `<article class="card">
     <div>
       <h2>${c.name||"Princess cruise"}</h2>
       <div class="meta">${c.ship||"Ship TBA"} · ${dateFmt(c.departure_date)} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
       <div class="route">${(c.itinerary||"").slice(0,310)}</div>
-      <div class="badges"><span class="badge">${c.available?"Available":"Unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel()}</span>${changeText}${lowText}</div>
+      <div class="badges"><span class="badge">${selectedAvailable?"Available":"Selected cabin unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel()}</span>${changeText}${lowText}</div>
     </div>
     <div class="pricing">
-      <div class="price">${money(p,cur)}${p!=null?" pp":""}</div>
+      <div class="price">${p==null?"Unavailable":`${money(p,cur)} pp`}</div>
       <div class="pernight">${ppn==null?"":`${money(ppn,cur)} pp / night`}</div>
       <div class="secondary">
-        ${$("#passengers").value==="2" ? `2-person total: <b>${money(total,cur)}</b><br>` : ""}
+        ${$("#passengers").value==="2" && total!=null ? `2-person total: <b>${money(total,cur)}</b><br>` : ""}
         Standard ${cabinLabels[cabin()]}: <b>${money(basePriceFor(c),cur)}</b><br>
-        ${$("#farePackage").value!=="standard"?`Package add-on: <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
+        ${$("#farePackage").value!=="standard"&&p!=null?`Package add-on: <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
         Solo premium: <b>${pct(solo)}</b><br>
         Historical low: <b>${money(low,cur)}</b>
       </div>
@@ -102,8 +103,8 @@ window.showHistory=function(id){
 function reset(){
   document.querySelectorAll("#ports input").forEach(x=>x.checked=true);
   $("#passengers").value="2"; $("#cabin").value="interior"; $("#farePackage").value="standard";
-  $("#minNights").value=1; $("#maxNights").value=60; $("#dateFrom").value=""; $("#dateTo").value=""; $("#maxPrice").value="";
-  $("#ship").value=""; $("#sort").value="dayprice"; $("#available").checked=true; $("#dropped").checked=false; render();
+  $("#minNights").value=1; $("#maxNights").value=""; $("#dateFrom").value=""; $("#dateTo").value=""; $("#maxPrice").value="";
+  $("#ship").value=""; $("#sort").value="dayprice"; $("#available").checked=false; $("#dropped").checked=false; render();
 }
 async function init(){
   const res=await fetch("../data/latest.json",{cache:"no-store"}); cruises=await res.json();
