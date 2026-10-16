@@ -4,7 +4,7 @@ import asyncio
 import copy
 import json
 import re
-from datetime import datetime
+from collections import Counter
 from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import async_playwright
@@ -13,7 +13,6 @@ from . import princess as base
 
 
 PRICING_PREFIX = "https://gw.api.princess.com/pcl-web/internal/caps/pc/pricing/v1/cruises/"
-PRODUCT_URL = "https://gw.api.princess.com/pcl-web/internal/resdb/p1.0/products"
 META_TO_CABIN = {
     "I": "interior",
     "O": "oceanview",
@@ -39,78 +38,117 @@ def _voyage_code(record: dict) -> str | None:
         return None
 
 
-def _parse_date_value(value) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
+async def _voyage_header_text(page, h1_text: str, body: str) -> str:
+    """Return text local to the current itinerary title, not the whole Princess page."""
+    best = h1_text or ""
+    try:
+        h1 = page.locator("h1").first
+        node = h1
+        for _ in range(8):
+            node = node.locator("xpath=..")
+            text = " ".join((await node.inner_text(timeout=1000)).split())
+            if not text:
+                continue
 
-    m = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
-    if m:
+            # Keep the smallest useful ancestor around this voyage title.
+            if h1_text and h1_text.lower() not in text.lower():
+                continue
+            if len(text) < 6000:
+                best = text
+
+            if base.parse_date(text) and base.SHIP_RE.search(text):
+                return text
+
+            if len(text) > 12000:
+                break
+    except Exception:
+        pass
+
+    # DOM structures can vary. As a second local-only fallback, take a short
+    # slice immediately after this itinerary title in the rendered page text.
+    if h1_text:
+        pos = body.lower().find(h1_text.lower())
+        if pos >= 0:
+            local = body[pos:pos + 2500]
+            if base.parse_date(local) or base.SHIP_RE.search(local):
+                return local
+
+    return best
+
+
+async def _scrape_detail_fixed(context, item: dict, semaphore: asyncio.Semaphore, index: int, total: int):
+    """Princess detail scraper with voyage-local ship/date extraction."""
+    async with semaphore:
+        page = await context.new_page()
         try:
-            return datetime.strptime(m.group(0), "%Y-%m-%d").date().isoformat()
-        except ValueError:
-            pass
+            url = base.au_detail_url(item["url"])
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await base.dismiss_noise(page)
+            body = await base.wait_for_cabin_prices(page, 20)
 
-    m = re.search(r"\b(20\d{2})(\d{2})(\d{2})\b", text)
-    if m:
-        try:
-            return datetime.strptime(m.group(0), "%Y%m%d").date().isoformat()
-        except ValueError:
-            pass
+            two = base.cabin_prices(body)
+            currency = base.detect_currency(body)
 
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%b %d, %Y",
-        "%B %d, %Y",
-        "%d %b %Y",
-        "%d %B %Y",
-    ):
-        try:
-            return datetime.strptime(text[:26], fmt).date().isoformat()
-        except ValueError:
-            continue
-    return None
+            h1_text = ""
+            try:
+                h1 = page.locator("h1")
+                if await h1.count():
+                    h1_text = " ".join((await h1.first.inner_text()).split())
+            except Exception:
+                pass
 
+            name = h1_text or item.get("name") or "Princess Cruise"
+            tm = base.TITLE_RE.search(name)
+            nights = int(tm.group(1)) if tm else item.get("nights")
+            if not nights or nights > 120:
+                nights = item.get("nights")
 
-def _extract_departure_date(data: dict) -> str | None:
-    """Find the voyage start/departure/sail date in Princess product data."""
-    preferred = (
-        "departuredate", "departdate", "saildate", "startdate",
-        "cruisestartdate", "voyagestartdate", "embarkdate",
-        "embarkationdate", "productstartdate",
-    )
-    fallback: list[str] = []
+            header_text = await _voyage_header_text(page, h1_text, body)
+            departure_date = base.parse_date(header_text)
+            ship_match = base.SHIP_RE.search(header_text)
+            ship = ship_match.group(0) if ship_match else None
+            dep = item.get("departure_port") or base.departure_port(header_text) or base.departure_port(body)
 
-    def walk(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                key_norm = re.sub(r"[^a-z]", "", str(key).lower())
-                if isinstance(child, str):
-                    parsed = _parse_date_value(child)
-                    if parsed:
-                        if any(token in key_norm for token in preferred):
-                            return parsed
-                        if "date" in key_norm:
-                            fallback.append(parsed)
-                found = walk(child)
-                if found:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = walk(child)
-                if found:
-                    return found
-        return None
+            one = {c: None for c in base.CABINS}
+            if await base.set_guest_count_on_detail(page, 1):
+                solo_body = await base.wait_for_cabin_prices(page, 15)
+                one = base.cabin_prices(solo_body)
 
-    found = walk(data)
-    return found or (fallback[0] if fallback else None)
+            record = {
+                "line": "Princess",
+                "name": name,
+                "ship": ship,
+                "departure_port": dep,
+                "arrival_port": None,
+                "departure_date": departure_date,
+                "nights": nights,
+                "itinerary": item.get("search_text") or body[:900],
+                "url": item["url"],
+                "available": any(v is not None for v in two.values()),
+                "currency": currency,
+                "voyage_code": item["voyage_code"],
+            }
+            for cabin in base.CABINS:
+                record[f"two_guest_{cabin}_pp"] = two.get(cabin)
+                record[f"one_guest_{cabin}"] = one.get(cabin)
+            record["two_guest_pp_price"] = two.get("interior")
+            record["one_guest_price"] = one.get("interior")
+            record["two_guest_total"] = round(two["interior"] * 2, 2) if two.get("interior") is not None else None
+            record["cruise_id"] = base.make_id(item["voyage_code"], departure_date)
+
+            print(
+                f"Detail {index}/{total}: {item['voyage_code']} | {name} | {departure_date} | "
+                f"{ship} | {currency} | Interior {two.get('interior')} | Balcony {two.get('balcony')}"
+            )
+            return record
+        except Exception as exc:
+            print(f"Detail scrape failed {index}/{total} for {item.get('voyage_code')}: {exc}")
+            return None
+        finally:
+            await page.close()
 
 
 def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, float | None]:
-    """Return the cheapest available one-person fare for each cabin meta."""
     result = {c: None for c in base.CABINS}
 
     for product in data.get("products", []):
@@ -119,7 +157,6 @@ def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, fl
             for fare in pricing.get("fares", []):
                 if (fare.get("fareType") or "").upper() != fare_type.upper():
                     continue
-
                 for category in fare.get("categories", []):
                     category_id = str(category.get("id") or "")
                     if not category_id:
@@ -129,7 +166,6 @@ def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, fl
                         continue
                     if (category.get("status") or "").upper() not in {"Y", "G", "B", "A"}:
                         continue
-
                     guests = category.get("guests") or []
                     if not guests:
                         continue
@@ -138,11 +174,9 @@ def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, fl
                         value = float(value)
                     except (TypeError, ValueError):
                         continue
-
                     current = result[cabin]
                     if current is None or value < current:
                         result[cabin] = value
-
     return result
 
 
@@ -151,11 +185,7 @@ async def _capture_pricing_session(context, seed_url: str):
     captured = {"headers": None, "payload": None}
 
     async def on_request(request):
-        if (
-            request.method == "POST"
-            and request.url.startswith(PRICING_PREFIX)
-            and captured["headers"] is None
-        ):
+        if request.method == "POST" and request.url.startswith(PRICING_PREFIX) and captured["headers"] is None:
             captured["headers"] = await request.all_headers()
             try:
                 captured["payload"] = json.loads(request.post_data or "{}")
@@ -171,7 +201,6 @@ async def _capture_pricing_session(context, seed_url: str):
         if captured["headers"] and captured["payload"]:
             break
         await page.wait_for_timeout(250)
-
     await page.close()
 
     if not captured["headers"] or not captured["payload"]:
@@ -183,51 +212,7 @@ async def _capture_pricing_session(context, seed_url: str):
         "accept-encoding", "cookie",
     ]:
         headers.pop(key, None)
-
     return headers, captured["payload"]
-
-
-async def _fetch_product_date(context, headers: dict, record: dict, semaphore: asyncio.Semaphore):
-    if record.get("departure_date"):
-        return
-
-    code = _voyage_code(record)
-    if not code:
-        return
-
-    params = {
-        "agencyCountry": "AU",
-        "cruiseType": "C",
-        "voyageStatus": "A",
-        "webDisplay": "Y",
-        "light": "false",
-        "productCode": code,
-        "promoFilter": "all",
-    }
-
-    async with semaphore:
-        try:
-            response = await context.request.get(
-                PRODUCT_URL,
-                params=params,
-                headers=headers,
-                timeout=30000,
-            )
-            if response.status != 200:
-                print(f"Product API {code}: HTTP {response.status}")
-                return
-
-            data = json.loads(await response.text())
-            departure_date = _extract_departure_date(data)
-            if not departure_date:
-                print(f"Princess date {code}: not found in product response")
-                return
-
-            record["departure_date"] = departure_date
-            record["cruise_id"] = base.make_id(code, departure_date)
-            print(f"Princess date {code}: {departure_date}")
-        except Exception as exc:
-            print(f"Product API {code} failed: {exc}")
 
 
 async def _fetch_one_solo(context, headers: dict, template_payload: dict, record: dict, semaphore: asyncio.Semaphore):
@@ -240,24 +225,20 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
         booking = payload.setdefault("booking", {})
         booking["currencyCode"] = "AUD"
         booking["guests"] = [{"country": "AU", "homeCity": "SYD"}]
-
-        agency = booking.setdefault("bookingAgency", {})
-        agency.update({
+        booking.setdefault("bookingAgency", {}).update({
             "id": "DIRECTAU",
             "bookingCompany": "PA",
             "currency": "AUD",
             "country": "AU",
         })
-
         payload.setdefault("filters", {})["cruises"] = []
         flags = payload.setdefault("retrieveFlags", {})
         flags["fareType"] = "BESTVALUE"
         flags["additionalGuestFare"] = True
 
-        url = PRICING_PREFIX + code
         try:
             response = await context.request.post(
-                url,
+                PRICING_PREFIX + code,
                 headers=headers,
                 data=json.dumps(payload),
                 timeout=30000,
@@ -271,7 +252,6 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
             for cabin in base.CABINS:
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
-
             print(
                 f"Solo API {code}: Interior {prices.get('interior')} | "
                 f"Balcony {prices.get('balcony')} | Suite {prices.get('suite')}"
@@ -280,9 +260,8 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
             print(f"Solo API {code} failed: {exc}")
 
 
-async def _enrich_records(records: list[dict], headless: bool):
+async def _populate_solo_prices(records: list[dict], headless: bool):
     priced = [r for r in records if r.get("two_guest_interior_pp") is not None and _voyage_code(r)]
-    coded = [r for r in records if _voyage_code(r)]
     if not priced:
         return
 
@@ -304,72 +283,76 @@ async def _enrich_records(records: list[dict], headless: bool):
         ])
 
         async def force_locale(route):
-            await route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps(base.AU_LOCALE),
-            )
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(base.AU_LOCALE))
 
         await context.route(base.LOCALE_URL, force_locale)
         headers, template_payload = await _capture_pricing_session(context, seed_url)
-
-        date_semaphore = asyncio.Semaphore(8)
-        solo_semaphore = asyncio.Semaphore(6)
-
+        semaphore = asyncio.Semaphore(6)
         await asyncio.gather(*(
-            _fetch_product_date(context, headers, record, date_semaphore)
-            for record in coded
-            if not record.get("departure_date")
-        ))
-
-        await asyncio.gather(*(
-            _fetch_one_solo(context, headers, template_payload, record, solo_semaphore)
+            _fetch_one_solo(context, headers, template_payload, record, semaphore)
             for record in priced
         ))
-
         await browser.close()
 
 
+def _validate_metadata(records: list[dict]):
+    dated = [r.get("departure_date") for r in records if r.get("departure_date")]
+    ships = [r.get("ship") for r in records if r.get("ship")]
+
+    if not dated:
+        raise RuntimeError("Princess returned no departure dates. Refusing to publish undated cruise data.")
+
+    date_counts = Counter(dated)
+    repeated_date, repeated_count = date_counts.most_common(1)[0]
+    if repeated_count > 10:
+        raise RuntimeError(
+            f"Princess metadata looks invalid: departure date {repeated_date} appeared on "
+            f"{repeated_count} cruises. Refusing to publish."
+        )
+
+    # A716A is our known-good Princess sentinel: Grand Princess, 2 Sep 2027.
+    sentinel = next((r for r in records if _voyage_code(r) == "A716A"), None)
+    if sentinel is None:
+        raise RuntimeError("Princess validation voyage A716A was not returned.")
+    if sentinel.get("ship") != "Grand Princess" or sentinel.get("departure_date") != "2027-09-02":
+        raise RuntimeError(
+            "Princess voyage metadata validation failed for A716A: "
+            f"ship={sentinel.get('ship')!r}, date={sentinel.get('departure_date')!r}. "
+            "Expected Grand Princess / 2027-09-02."
+        )
+
+    print(f"Princess metadata validated: {len(dated)}/{len(records)} dates, {len(ships)}/{len(records)} ships.")
+
+
 async def collect(headless: bool = True):
-    # Keep the proven 2-person browser scrape untouched. Disable the unreliable
-    # guest-picker path, then enrich records with Princess's product dates and
-    # one-person pricing API using the authenticated/session headers from the page.
+    # Replace only the unreliable metadata portion of the base detail scraper.
     original_set_guest = base.set_guest_count_on_detail
+    original_scrape_detail = base.scrape_detail
     base.set_guest_count_on_detail = _disable_page_solo
+    base.scrape_detail = _scrape_detail_fixed
     try:
         records = await base.collect(headless=headless)
     finally:
         base.set_guest_count_on_detail = original_set_guest
+        base.scrape_detail = original_scrape_detail
 
     priced = [r for r in records if r.get("two_guest_interior_pp") is not None]
     if not priced:
-        raise RuntimeError(
-            "Princess returned no usable cabin prices. Refusing to overwrite the live dashboard."
-        )
+        raise RuntimeError("Princess returned no usable cabin prices. Refusing to overwrite the live dashboard.")
 
     non_aud = [r for r in priced if (r.get("currency") or "").upper() != "AUD"]
     if non_aud:
         currencies = sorted({(r.get("currency") or "UNKNOWN").upper() for r in non_aud})
         raise RuntimeError(
-            f"Princess returned non-AUD pricing ({', '.join(currencies)}). "
-            "Refusing to overwrite the live dashboard."
+            f"Princess returned non-AUD pricing ({', '.join(currencies)}). Refusing to overwrite the live dashboard."
         )
 
-    await _enrich_records(records, headless=headless)
+    _validate_metadata(records)
+    await _populate_solo_prices(records, headless=headless)
 
-    dated = sum(1 for r in records if r.get("departure_date"))
     solo_priced = sum(1 for r in records if r.get("one_guest_interior") is not None)
-    print(f"Princess departure dates captured for {dated}/{len(records)} cruises.")
     print(f"Princess solo Interior pricing captured for {solo_priced}/{len(records)} cruises.")
-
-    if dated == 0:
-        raise RuntimeError(
-            "Princess returned no departure dates. Refusing to publish undated cruise data."
-        )
-
     if solo_priced == 0:
-        raise RuntimeError(
-            "Princess returned no usable solo pricing. Refusing to publish an empty 1-person view."
-        )
+        raise RuntimeError("Princess returned no usable solo pricing. Refusing to publish an empty 1-person view.")
 
     return records
