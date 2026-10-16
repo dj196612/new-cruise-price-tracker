@@ -34,23 +34,26 @@ QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $so
 
 
 def _headers() -> dict[str, str]:
+    # Royal's public cruise catalogue is reliably populated with its standard
+    # anonymous US search headers. We only use this call for sailing metadata;
+    # pricing below is still requested explicitly for AUS / AUD / SYD.
     return {
         "accept": "*/*",
-        "accept-language": "en-AU,en;q=0.9",
+        "accept-language": "en-US,en;q=0.9",
         "adrum": "isAjax:true",
         "apollographql-client-name": "cruise-search-widget",
         "app-name": "graph",
         "brand": "R",
         "cache-control": "no-cache",
         "content-type": "application/json",
-        "country": "AUS",
-        "countryalpha2code": "AU",
-        "currency": "AUD",
+        "country": "USA",
+        "countryalpha2code": "US",
+        "currency": "USD",
         "language": "en",
-        "office": "SYD",
+        "office": "MIA",
         "pragma": "no-cache",
         "request-timeout": "20",
-        "referer": "https://www.royalcaribbean.com/aus/en/cruises",
+        "referer": "https://www.royalcaribbean.com/",
         "x-session-id": str(uuid.uuid4()),
     }
 
