@@ -34,4 +34,16 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run Carnival diagnostic
-        run: python run_carnival.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_carnival.py 2>&1 | tee carnival-diagnostic.txt
+
+      - name: Upload redacted Carnival diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carnival-diagnostic
+          path: carnival-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 3
