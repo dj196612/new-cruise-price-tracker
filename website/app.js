@@ -59,17 +59,18 @@ function sortRows(rows){
     return (perNight(a)??1e15)-(perNight(b)??1e15);
   });
 }
-function dateFmt(s){ return !s?"Date unavailable":new Date(s+"T12:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"}); }
+function dateFmt(s){ return !s?"":new Date(s+"T12:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"}); }
 function packageLabel(){ return {standard:"Princess Standard",plus:"Princess Plus",premier:"Princess Premier"}[$("#farePackage").value]; }
 function card(c){
   const p=priceFor(c), ppn=perNight(c), total=currentTotal(c), cur=c.currency||"AUD", low=historicalLow(c), change=priceChange(c), solo=soloPremium(c);
   const changeText = change==null?"":`<span class="badge ${change<0?"drop":"rise"}">${change<0?"↓":"↑"} ${money(Math.abs(change),cur)} since previous check</span>`;
   const lowText = p!=null&&low!=null&&p<=low ? `<span class="badge low">Historical low</span>` : "";
   const selectedAvailable = p!=null;
+  const titleDate = c.departure_date ? ` - ${dateFmt(c.departure_date)}` : "";
   return `<article class="card">
     <div>
-      <h2>${c.name||"Princess cruise"}</h2>
-      <div class="meta">${c.ship||"Ship TBA"} · ${dateFmt(c.departure_date)} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
+      <h2>${c.name||"Princess cruise"}${titleDate}</h2>
+      <div class="meta">${c.ship||"Ship TBA"} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
       <div class="route">${(c.itinerary||"").slice(0,310)}</div>
       <div class="badges"><span class="badge">${selectedAvailable?"Available":"Selected cabin unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel()}</span>${changeText}${lowText}</div>
     </div>
