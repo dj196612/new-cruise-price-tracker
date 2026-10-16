@@ -68,9 +68,9 @@ async def _search(request):
     payload = {
         "operationName": "cruiseSearch_Cruises",
         "variables": {
-            "filters": json.dumps({"departurePort": list(PORTS)}, separators=(",", ":")),
-            "sort": {"by": "PRICE"},
-            "pagination": {"count": 100, "skip": 0},
+            "filters": "{}",
+            "sort": {"by": "DATE"},
+            "pagination": {"count": 250, "skip": 0},
         },
         "query": QUERY,
     }
@@ -87,8 +87,14 @@ async def _search(request):
         return []
     results = (((data.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
     cruises = results.get("cruises") or []
-    print(f"RC_GRAPH_TOTAL {results.get('total')} RC_GRAPH_CRUISES {len(cruises)}")
-    return cruises
+    local = []
+    for cruise in cruises:
+        it = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
+        dep = ((it.get("departurePort") or {}).get("code") or "").upper()
+        if dep in PORTS:
+            local.append(cruise)
+    print(f"RC_GRAPH_TOTAL {results.get('total')} RC_GRAPH_CRUISES {len(cruises)} RC_LOCAL_CRUISES {len(local)}")
+    return local
 
 
 async def _price(request, sailing: dict, adults: int):
@@ -136,9 +142,6 @@ async def diagnostic(headless: bool = True):
         sample = None
         for cruise in cruises:
             it = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-            dep = ((it.get("departurePort") or {}).get("code") or "").upper()
-            if dep not in PORTS:
-                continue
             sailings = cruise.get("sailings") or []
             if not sailings:
                 continue
@@ -149,6 +152,7 @@ async def diagnostic(headless: bool = True):
                     "name": it.get("name"),
                     "ship": (it.get("ship") or {}).get("name"),
                     "departure": (it.get("departurePort") or {}).get("name"),
+                    "departureCode": (it.get("departurePort") or {}).get("code"),
                     "nights": it.get("totalNights"),
                     "sailing": sailings[0],
                 }, separators=(",", ":"))
