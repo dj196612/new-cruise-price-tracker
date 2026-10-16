@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -11,8 +12,30 @@ from urllib.parse import urlsplit, urlunsplit
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 LANDING_URL = "https://www.princess.com/cruise-search/"
+LOCALE_URL = "https://gw.api.princess.com/pcl-web/internal/guest/p1.0/locale"
 PORTS = ("Sydney", "Melbourne", "Brisbane")
 CABINS = ("interior", "oceanview", "balcony", "mini_suite", "suite")
+
+AU_LOCALE = {
+    "locale": {
+        "zipCode": "2000",
+        "ipAddress": "203.0.113.1",
+        "status": "AU",
+        "country": "AU",
+        "countryPhone": "13 24 28",
+        "specialOffers": "true",
+        "brochures": "true",
+        "lastUpdated": "1792121231",
+        "regionCode": "NSW",
+        "timezone": "Australia/Sydney",
+        "defaultHomeCity": "SYD",
+        "primaryCurrency": "AUD",
+        "secondaryCurrency": "NZD",
+        "aircity": "SYD",
+        "isEU": "false",
+        "isIntl": True,
+    }
+}
 
 TITLE_RE = re.compile(r"(\d+)\s*[- ]?Day\s+(.{2,120})", re.I)
 DATE_RE = re.compile(
@@ -32,16 +55,13 @@ def canonical_url(url: str) -> str:
     if not url:
         return ""
     parts = urlsplit(url)
-    # Keep voyageCode query; remove only the fragment.
     return urlunsplit((parts.scheme or "https", parts.netloc or "www.princess.com", parts.path.rstrip("/"), parts.query, ""))
 
 
 def au_detail_url(url: str) -> str:
-    parts = urlsplit(canonical_url(url))
-    path = parts.path
-    if not path.startswith("/en-au/"):
-        path = "/en-au" + (path if path.startswith("/") else "/" + path)
-    return urlunsplit(("https", "www.princess.com", path, parts.query, ""))
+    # The valid itinerary route is the global route. AU pricing is controlled by
+    # the Princess locale/session bootstrap, not by an /en-au/ path prefix.
+    return canonical_url(url)
 
 
 def parse_date(text: str) -> Optional[str]:
@@ -115,7 +135,7 @@ async def first_visible(locator):
 
 
 async def dismiss_noise(page: Page):
-    for label in ("Accept All Cookies", "Accept Cookies", "Accept", "I Agree", "Close"):
+    for label in ("Accept All Cookies", "Accept Cookies", "Accept", "I Agree", "I Acknowledge", "Close"):
         try:
             item = await first_visible(page.get_by_role("button", name=re.compile(label, re.I)))
             if item is not None:
@@ -373,6 +393,16 @@ async def collect(headless=True):
             extra_http_headers={"Accept-Language": "en-AU,en;q=0.9"},
         )
 
+        await context.add_cookies([
+            {"name": "cookie_geo_country", "value": "AU", "domain": ".princess.com", "path": "/"},
+            {"name": "cookie_url_country", "value": "AU", "domain": ".princess.com", "path": "/"},
+        ])
+
+        async def force_locale(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(AU_LOCALE))
+
+        await context.route(LOCALE_URL, force_locale)
+
         search_page = await context.new_page()
         expected = await select_australian_departure_ports(search_page)
         items = await collect_search_items(search_page, expected)
@@ -384,10 +414,22 @@ async def collect(headless=True):
         )
         records = [r for r in scraped if r is not None]
 
+        priced_count = sum(1 for r in records if r.get("two_guest_interior_pp") is not None)
+        non_aud = [r for r in records if r.get("two_guest_interior_pp") is not None and (r.get("currency") or "").upper() != "AUD"]
+
         (debug / "princess-counts.txt").write_text(
-            f"expected={expected}\nsearch_items={len(items)}\nrecords={len(records)}\npriced={sum(1 for r in records if r.get('two_guest_interior_pp') is not None)}\n",
+            f"expected={expected}\nsearch_items={len(items)}\nrecords={len(records)}\npriced={priced_count}\nnon_aud={len(non_aud)}\n",
             encoding="utf-8",
         )
-        print(f"Princess collector returned {len(records)} records, {sum(1 for r in records if r.get('two_guest_interior_pp') is not None)} with Interior pricing.")
+        print(f"Princess collector returned {len(records)} records, {priced_count} with Interior pricing.")
+
         await browser.close()
+
+        if priced_count == 0:
+            raise RuntimeError("Princess returned no usable cabin prices. Refusing to overwrite the live dashboard.")
+        if non_aud:
+            currencies = sorted({(r.get("currency") or "UNKNOWN").upper() for r in non_aud})
+            raise RuntimeError(
+                f"Princess returned non-AUD pricing ({', '.join(currencies)}). Refusing to overwrite the live dashboard."
+            )
         return records
