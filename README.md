@@ -1,7 +1,11 @@
-# Princess Cruise Price Tracker
+# Cruise Price Tracker
 
-Version 1 of a multi-cruise-line tracker. Princess is deliberately isolated in `collectors/princess.py`
-so future cruise lines can use the same database and dashboard.
+Tracks Princess, Royal Caribbean, Celebrity, Carnival and NCL sailings from Australian ports
+(1-guest solo and 2-guest fares). Each line has its own collector in `collectors/` and its own
+GitHub Actions workflow; all share the same database and dashboard.
+
+Solo fares for Royal Caribbean and Celebrity come from `collectors/rcg_solo_graph.py` (the site's own
+AU cruise-search GraphQL replayed at 1 adult), with the itinerary API as a fallback.
 
 ## What it tracks
 

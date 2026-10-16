@@ -148,36 +148,88 @@ async def _scrape_detail_fixed(context, item: dict, semaphore: asyncio.Semaphore
             await page.close()
 
 
-def _solo_cabin_prices(data: dict, fare_type: str = "BESTVALUE") -> dict[str, float | None]:
-    result = {c: None for c in base.CABINS}
+# The 2-guest price on the dashboard is scraped from the page as Princess
+# Standard (fare_basis "Princess Standard", Plus shown as a per-night add-on),
+# so solo must be requested on the same fare type or solo premium % compares
+# Standard against Plus.
+SOLO_FARE_TYPE = "BESTFARE"
+BOOKABLE_STATUSES = {"Y", "G", "B", "A"}
+_ID_KEYS = ("cruiseId", "voyageCode", "productId", "id", "code")
 
-    for product in data.get("products", []):
-        for cruise in product.get("cruises", []):
-            pricing = cruise.get("pricing") or {}
-            for fare in pricing.get("fares", []):
-                if (fare.get("fareType") or "").upper() != fare_type.upper():
+
+def _ids(obj: dict) -> set[str]:
+    return {str(obj.get(k)).strip().upper() for k in _ID_KEYS if obj.get(k)}
+
+
+def _base_code(code: str) -> str | None:
+    """A714B -> A714, 1735A -> 1735 (segment / combined voyages)."""
+    m = re.match(r"^(.*\d)[A-Z]+$", code.upper())
+    return m.group(1) if m else None
+
+
+def _matching_cruises(data: dict, code: str) -> tuple[list[dict], list[str]]:
+    """Return only the cruise(s) for this voyage code, never a mix of segments.
+
+    Matches at cruise level first, then product level. If the response holds a
+    single cruise it is used as-is (the per-code endpoint's normal case).
+    """
+    code = code.upper()
+    products = data.get("products") or []
+    all_cruises = [(p, c) for p in products for c in (p.get("cruises") or [])]
+    seen = sorted({i for p, c in all_cruises for i in (_ids(c) | _ids(p))})
+
+    exact = [c for p, c in all_cruises if code in _ids(c)]
+    if exact:
+        return exact, seen
+    by_product = [c for p, c in all_cruises if code in _ids(p)]
+    if by_product:
+        return by_product, seen
+    if len(all_cruises) == 1:
+        return [all_cruises[0][1]], seen
+    return [], seen
+
+
+def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE) -> tuple[dict[str, float | None], Counter]:
+    result = {c: None for c in base.CABINS}
+    statuses: Counter = Counter()
+
+    for cruise in cruises:
+        pricing = cruise.get("pricing") or {}
+        for fare in pricing.get("fares", []):
+            if (fare.get("fareType") or "").upper() != fare_type.upper():
+                continue
+            for category in fare.get("categories", []):
+                category_id = str(category.get("id") or "")
+                if not category_id:
                     continue
-                for category in fare.get("categories", []):
-                    category_id = str(category.get("id") or "")
-                    if not category_id:
-                        continue
-                    cabin = META_TO_CABIN.get(category_id[0].upper())
-                    if cabin is None:
-                        continue
-                    if (category.get("status") or "").upper() not in {"Y", "G", "B", "A"}:
-                        continue
-                    guests = category.get("guests") or []
-                    if not guests:
-                        continue
-                    value = guests[0].get("fare")
-                    try:
-                        value = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    current = result[cabin]
-                    if current is None or value < current:
-                        result[cabin] = value
-    return result
+                cabin = META_TO_CABIN.get(category_id[0].upper())
+                if cabin is None:
+                    continue
+                status = (category.get("status") or "").upper()
+                statuses[status or "?"] += 1
+                if status not in BOOKABLE_STATUSES:
+                    continue
+                guests = category.get("guests") or []
+                if not guests:
+                    continue
+                value = guests[0].get("fare")
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                current = result[cabin]
+                if current is None or value < current:
+                    result[cabin] = value
+    return result, statuses
+
+
+def _sail_date(cruises: list[dict]) -> str | None:
+    for cruise in cruises:
+        raw = str(cruise.get("sailDate") or cruise.get("departureDate") or "")
+        digits = re.sub(r"\D", "", raw)[:8]
+        if len(digits) == 8:
+            return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    return None
 
 
 async def _capture_pricing_session(context, seed_url: str):
@@ -215,43 +267,82 @@ async def _capture_pricing_session(context, seed_url: str):
     return headers, captured["payload"]
 
 
+def _solo_payload(template_payload: dict) -> dict:
+    payload = copy.deepcopy(template_payload)
+    booking = payload.setdefault("booking", {})
+    booking["currencyCode"] = "AUD"
+    booking["guests"] = [{"country": "AU", "homeCity": "SYD"}]
+    booking.setdefault("bookingAgency", {}).update({
+        "id": "DIRECTAU",
+        "bookingCompany": "PA",
+        "currency": "AUD",
+        "country": "AU",
+    })
+    payload.setdefault("filters", {})["cruises"] = []
+    flags = payload.setdefault("retrieveFlags", {})
+    flags["fareType"] = SOLO_FARE_TYPE
+    flags["additionalGuestFare"] = True
+    return payload
+
+
+async def _post_pricing(context, headers: dict, payload: dict, path_code: str) -> dict | None:
+    response = await context.request.post(
+        PRICING_PREFIX + path_code,
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=30000,
+    )
+    if response.status != 200:
+        print(f"Solo API {path_code}: HTTP {response.status}")
+        return None
+    return json.loads(await response.text())
+
+
 async def _fetch_one_solo(context, headers: dict, template_payload: dict, record: dict, semaphore: asyncio.Semaphore):
     code = _voyage_code(record)
     if not code or record.get("two_guest_interior_pp") is None:
         return
 
     async with semaphore:
-        payload = copy.deepcopy(template_payload)
-        booking = payload.setdefault("booking", {})
-        booking["currencyCode"] = "AUD"
-        booking["guests"] = [{"country": "AU", "homeCity": "SYD"}]
-        booking.setdefault("bookingAgency", {}).update({
-            "id": "DIRECTAU",
-            "bookingCompany": "PA",
-            "currency": "AUD",
-            "country": "AU",
-        })
-        payload.setdefault("filters", {})["cruises"] = []
-        flags = payload.setdefault("retrieveFlags", {})
-        flags["fareType"] = "BESTVALUE"
-        flags["additionalGuestFare"] = True
-
+        payload = _solo_payload(template_payload)
         try:
-            response = await context.request.post(
-                PRICING_PREFIX + code,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=30000,
-            )
-            if response.status != 200:
-                print(f"Solo API {code}: HTTP {response.status}")
+            # Segment / combined voyages (A714B, 1735A ...) may only be priced
+            # under the parent code, so retry with it and pick the exact cruise.
+            attempts = [code]
+            parent = _base_code(code)
+            if parent:
+                attempts.append(parent)
+
+            prices, statuses, cruises, seen = None, Counter(), [], []
+            for path_code in attempts:
+                data = await _post_pricing(context, headers, payload, path_code)
+                if not data:
+                    continue
+                cruises, seen = _matching_cruises(data, code)
+                if not cruises:
+                    continue
+                prices, statuses = _solo_cabin_prices(cruises)
+                if prices.get("interior") is not None or any(v is not None for v in prices.values()):
+                    if path_code != code:
+                        print(f"Solo API {code}: priced via parent code {path_code}")
+                    break
+
+            if not cruises:
+                print(f"Solo API {code}: no matching cruise in response; ids returned={seen[:12]}")
+                return
+            if not prices or not any(v is not None for v in prices.values()):
+                print(f"Solo API {code}: no bookable {SOLO_FARE_TYPE} solo fare; category statuses={dict(statuses)}")
                 return
 
-            data = json.loads(await response.text())
-            prices = _solo_cabin_prices(data, "BESTVALUE")
             for cabin in base.CABINS:
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
+            if not record.get("departure_date"):
+                api_date = _sail_date(cruises)
+                if api_date:
+                    record["departure_date"] = api_date
+                    record["cruise_id"] = base.make_id(code, api_date)
+                    print(f"Solo API {code}: departure date filled from pricing API -> {api_date}")
             print(
                 f"Solo API {code}: Interior {prices.get('interior')} | "
                 f"Balcony {prices.get('balcony')} | Suite {prices.get('suite')}"
