@@ -2,6 +2,7 @@ import asyncio
 from urllib.parse import urlsplit, urlunsplit
 
 import collectors.princess as princess
+import collectors.princess_runtime as princess_runtime
 from export_json import main as export_json
 from storage import save_observations
 
@@ -35,11 +36,13 @@ async def _all_itinerary_urls(page):
     return out
 
 
-# Patch the Princess adapter at runtime so all downstream identity/detail logic
-# preserves voyageCode and sees the full virtualised catalogue.
+# Preserve voyageCode and expose the full virtualised catalogue.
 princess.canonical_url = _canonical_url_keep_query
 princess.unique_itinerary_urls = _all_itinerary_urls
-collect = princess.collect
+
+# This wrapper also fixes the invalid /en-au/ itinerary URL and refuses to
+# publish a run unless real AUD cabin pricing was obtained.
+collect = princess_runtime.collect
 
 
 async def main():
@@ -48,8 +51,7 @@ async def main():
     print(f"Princess collector returned {len(records)} sailings.")
     if not records:
         raise SystemExit(
-            "No Princess cruises were found. Check debug/princess-no-results.png "
-            "and debug/princess-no-results.html for the current Princess page."
+            "No Princess cruises were found. Check the Princess collector logs for the current page structure."
         )
 
     save_observations(records, line="Princess")
