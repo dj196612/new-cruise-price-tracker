@@ -18,10 +18,15 @@ def main():
         prev = r.get("prev_price")
         r["price_change"] = round(current - prev, 2) if current is not None and prev is not None else None
 
-        if r.get("line") == "Princess":
+        line = r.get("line")
+        if line == "Princess":
             r["fare_basis"] = "Princess Standard"
             r["plus_addon_per_night"] = 79
             r["premier_addon_per_night"] = 129
+        elif line == "Celebrity Cruises":
+            r["fare_basis"] = "Celebrity Fare"
+            r["plus_addon_per_night"] = None
+            r["premier_addon_per_night"] = None
         else:
             r["fare_basis"] = "Royal Caribbean Fare"
             r["plus_addon_per_night"] = None
