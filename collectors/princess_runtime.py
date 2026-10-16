@@ -1,39 +1,73 @@
 from __future__ import annotations
 
-from urllib.parse import urlsplit, urlunsplit
+import re
+from urllib.parse import urlsplit
+
+from playwright.async_api import async_playwright
 
 from . import princess as base
 
-
-def _australian_detail_url(url: str) -> str:
-    """Route Princess itinerary pages through the Australian market host."""
-    parts = urlsplit(base.canonical_url(url))
-    path = parts.path
-    if not path.startswith("/en-au/"):
-        path = "/en-au" + (path if path.startswith("/") else "/" + path)
-    return urlunsplit(("https", "au-www.princess.com", path, parts.query, ""))
+PROBE_URL = "https://www.princess.com/itinerary-details?voyageCode=A716A"
 
 
-# Catalogue discovery stays on the known-working www.princess.com search page.
-# Only itinerary detail requests are routed through Princess's Australian host.
-base.au_detail_url = _australian_detail_url
+def _interesting(url: str) -> bool:
+    u = (url or "").lower()
+    return any(k in u for k in (
+        "price", "fare", "cabin", "stateroom", "voyage", "itinerary", "booking", "availability", "api", "graphql"
+    ))
+
+
+async def _probe_pricing_calls(headless: bool = True):
+    print("Running Princess pricing API diagnostic for voyage A716A...")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            locale="en-AU",
+            timezone_id="Australia/Sydney",
+            viewport={"width": 1440, "height": 1000},
+            extra_http_headers={"Accept-Language": "en-AU,en;q=0.9"},
+        )
+        page = await context.new_page()
+
+        seen = set()
+
+        async def log_response(response):
+            url = response.url
+            if not _interesting(url) or url in seen:
+                return
+            seen.add(url)
+            ctype = (response.headers or {}).get("content-type", "")
+            print(f"PRINCESS_NET {response.status} {ctype} {url}")
+            if "json" in ctype.lower():
+                try:
+                    text = await response.text()
+                    flat = re.sub(r"\s+", " ", text)
+                    if re.search(r"AUD|USD|Interior|Balcony|Mini-Suite|Suite|price|fare", flat, re.I):
+                        print("PRINCESS_JSON", flat[:1800])
+                except Exception as exc:
+                    print(f"PRINCESS_JSON_READ_ERROR {exc}")
+
+        page.on("response", log_response)
+        await page.goto(PROBE_URL, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(20000)
+
+        body = " ".join((await page.locator("body").inner_text()).split())
+        print("PRINCESS_PAGE_SNIPPET", body[:2200])
+
+        cookies = await context.cookies()
+        for c in cookies:
+            name = (c.get("name") or "").lower()
+            if any(k in name for k in ("country", "locale", "currency", "market", "region", "geo", "lang")):
+                print(f"PRINCESS_COOKIE {c.get('name')}={c.get('value')} domain={c.get('domain')}")
+
+        await browser.close()
 
 
 async def collect(headless: bool = True):
-    records = await base.collect(headless=headless)
-
-    priced = [r for r in records if r.get("two_guest_interior_pp") is not None]
-    if not priced:
-        raise RuntimeError(
-            "Princess returned no usable cabin prices. Refusing to overwrite the live dashboard."
-        )
-
-    non_aud = [r for r in priced if (r.get("currency") or "").upper() != "AUD"]
-    if non_aud:
-        currencies = sorted({(r.get("currency") or "UNKNOWN").upper() for r in non_aud})
-        raise RuntimeError(
-            f"Princess returned non-AUD pricing ({', '.join(currencies)}). "
-            "Refusing to overwrite the live dashboard."
-        )
-
-    return records
+    # Temporary diagnostic mode: probe one known voyage so we can identify the
+    # actual Princess fare API and Australian-market parameter without waiting
+    # for a full 93-cruise scrape.
+    await _probe_pricing_calls(headless=headless)
+    raise RuntimeError(
+        "Princess fare API diagnostic complete. Inspect PRINCESS_NET / PRINCESS_JSON lines in the workflow log."
+    )
