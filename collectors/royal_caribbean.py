@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import uuid
+from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright
 
 GRAPH_URL = "https://www.royalcaribbean.com/graph"
 ROOM_URL = "https://www.royalcaribbean.com/itinerary/api/v1/sailings"
 PORTS = ("BNE", "SYD")
+PAGE_SIZE = 250
 
 QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $sort: CruiseSearchSort, $pagination: CruiseSearchPagination) {
   cruiseSearch(filters: $filters, qualifiers: $qualifiers, sort: $sort, pagination: $pagination) {
@@ -33,10 +35,10 @@ QUERY = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $so
 }"""
 
 
-def _headers() -> dict[str, str]:
-    # Royal's public catalogue is reliably populated using its standard
-    # anonymous US search context. This is metadata discovery only; pricing
-    # below is explicitly requested for Australia in AUD.
+def _catalogue_headers() -> dict[str, str]:
+    # Royal's public catalogue is reliably populated using its anonymous US
+    # search context. This call is metadata only. All prices are requested
+    # separately for Australia in AUD.
     return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -58,75 +60,91 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _package_code(sailing_id: str | None) -> str | None:
-    if not sailing_id or "_" not in sailing_id:
-        return None
-    prefix, suffix = sailing_id.rsplit("_", 1)
-    if len(suffix) == 10 and suffix[4] == "-" and suffix[7] == "-":
-        return prefix
+def _package_code(sailing: dict) -> str | None:
+    code = ((sailing.get("itinerary") or {}).get("code") or "").strip()
+    if code:
+        return code
+    sailing_id = sailing.get("id") or ""
+    if "_" in sailing_id:
+        return sailing_id.rsplit("_", 1)[0]
     return None
-
-
-async def _search(request):
-    payload = {
-        "operationName": "cruiseSearch_Cruises",
-        "variables": {
-            "filters": "{}",
-            "sort": {"by": "RECOMMENDED"},
-            "pagination": {"count": 250, "skip": 0},
-        },
-        "query": QUERY,
-    }
-    response = await request.post(GRAPH_URL, headers=_headers(), data=json.dumps(payload), timeout=30000)
-    text = await response.text()
-    print(f"RC_GRAPH_STATUS {response.status}")
-    try:
-        data = json.loads(text)
-    except Exception:
-        print(f"RC_GRAPH_NON_JSON {' '.join(text.split())[:2000]}")
-        return []
-    if data.get("errors"):
-        print(f"RC_GRAPH_ERRORS {json.dumps(data['errors'])[:4000]}")
-        return []
-    results = (((data.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
-    cruises = results.get("cruises") or []
-    local = []
-    for cruise in cruises:
-        it = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-        dep = ((it.get("departurePort") or {}).get("code") or "").upper()
-        if dep in PORTS:
-            local.append(cruise)
-    print(f"RC_GRAPH_TOTAL {results.get('total')} RC_GRAPH_CRUISES {len(cruises)} RC_LOCAL_CRUISES {len(local)}")
-    return local
 
 
 def _room_summary(sailing: dict) -> dict:
     out = {}
+    mapping = {
+        "INTERIOR": "interior",
+        "OUTSIDE": "oceanview",
+        "BALCONY": "balcony",
+        "DELUXE": "suite",
+    }
     for room in sailing.get("rooms") or []:
-        code = (room.get("code") or "").upper()
-        mapped = {
-            "INTERIOR": "interior",
-            "OUTSIDE": "oceanview",
-            "BALCONY": "balcony",
-            "DELUXE": "suite",
-        }.get(code)
+        mapped = mapping.get((room.get("code") or "").upper())
         if not mapped:
             continue
         pricing = room.get("pricing") or {}
+        amount = pricing.get("amount")
+        total = pricing.get("total")
+        if amount is None and total is None:
+            continue
         out[mapped] = {
-            "per_person": pricing.get("amount"),
-            "total": pricing.get("total"),
+            "per_person": amount,
+            "total": total,
             "category": room.get("categoryCode"),
         }
     return out
 
 
-async def _price(request, sailing: dict, adults: int):
-    sailing_id = sailing.get("id")
-    package = _package_code(sailing_id)
+async def _catalogue_page(request, skip: int) -> tuple[int, list[dict]]:
+    payload = {
+        "operationName": "cruiseSearch_Cruises",
+        "variables": {
+            "filters": "{}",
+            "sort": {"by": "RECOMMENDED"},
+            "pagination": {"count": PAGE_SIZE, "skip": skip},
+        },
+        "query": QUERY,
+    }
+    response = await request.post(
+        GRAPH_URL,
+        headers=_catalogue_headers(),
+        data=json.dumps(payload),
+        timeout=30000,
+    )
+    if response.status != 200:
+        raise RuntimeError(f"Royal Caribbean catalogue HTTP {response.status} at skip={skip}")
+    body = await response.json()
+    if body.get("errors"):
+        raise RuntimeError(f"Royal Caribbean catalogue GraphQL errors: {body['errors']}")
+    results = (((body.get("data") or {}).get("cruiseSearch") or {}).get("results") or {})
+    return int(results.get("total") or 0), results.get("cruises") or []
+
+
+async def _search_all(request) -> list[dict]:
+    total = None
+    skip = 0
+    local: list[dict] = []
+    while total is None or skip < total:
+        page_total, cruises = await _catalogue_page(request, skip)
+        if total is None:
+            total = page_total
+            print(f"RC catalogue total: {total}")
+        if not cruises:
+            break
+        for cruise in cruises:
+            itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
+            dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
+            if dep in PORTS:
+                local.append(cruise)
+        print(f"RC catalogue page skip={skip}: {len(cruises)} groups, local groups so far={len(local)}")
+        skip += len(cruises)
+    return local
+
+
+async def _price(request, sailing: dict, adults: int) -> dict | None:
+    package = _package_code(sailing)
     sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
     if not package or not sail_date:
-        print(f"RC_PRICE_SKIP adults={adults} sailing_id={sailing_id} sail_date={sail_date}")
         return None
 
     params = {
@@ -149,48 +167,52 @@ async def _price(request, sailing: dict, adults: int):
         },
         timeout=30000,
     )
-    text = await response.text()
-    print(f"RC_PRICE_STATUS adults={adults} package={package} date={sail_date} status={response.status}")
+    if response.status not in (200, 404):
+        print(f"RC price HTTP {response.status}: adults={adults} package={package} date={sail_date}")
+        return None
+    if response.status == 404:
+        return None
     try:
-        body = json.loads(text)
+        body = await response.json()
     except Exception:
-        print(f"RC_PRICE_NON_JSON adults={adults} {' '.join(text.split())[:2000]}")
         return None
 
     target_id = f"{package}_{sail_date}"
-    returned = body.get("sailings") or []
     exact = next(
         (
-            s for s in returned
+            s for s in (body.get("sailings") or [])
             if s.get("id") == target_id
             or (s.get("packageCode") == package and (s.get("sailDate") or s.get("startDate")) == sail_date)
         ),
         None,
     )
-    if exact is None:
-        alternatives = [
-            {
-                "id": s.get("id"),
-                "packageCode": s.get("packageCode"),
-                "sailDate": s.get("sailDate") or s.get("startDate"),
-            }
-            for s in returned[:10]
-        ]
-        print(
-            f"RC_PRICE_NO_EXACT_MATCH adults={adults} package={package} date={sail_date} "
-            + json.dumps(alternatives, separators=(",", ":"))
-        )
+    return _room_summary(exact) if exact else None
+
+
+def _au_url(cruise: dict, sailing: dict) -> str:
+    product = (cruise.get("productViewLink") or "").lstrip("/")
+    path = product.split("?", 1)[0]
+    package = _package_code(sailing) or ""
+    sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
+    query = urlencode({
+        "sailDate": sail_date,
+        "packageCode": package,
+        "groupId": cruise.get("id") or "",
+        "country": "AUS",
+    })
+    if path:
+        return f"https://www.royalcaribbean.com/aus/en/{path}?{query}"
+    return "https://www.royalcaribbean.com/aus/en/cruises"
+
+
+def _price_value(summary: dict | None, cabin: str, field: str) -> float | None:
+    if not summary:
         return None
-
-    summary = _room_summary(exact)
-    print(
-        f"RC_PRICE_EXACT_MATCH adults={adults} package={package} date={sail_date} "
-        + json.dumps(summary, separators=(",", ":"))
-    )
-    return summary
+    value = (summary.get(cabin) or {}).get(field)
+    return float(value) if isinstance(value, (int, float)) else None
 
 
-async def diagnostic(headless: bool = True):
+async def collect(headless: bool = True) -> list[dict]:
     del headless
     async with async_playwright() as p:
         request = await p.request.new_context(
@@ -198,42 +220,75 @@ async def diagnostic(headless: bool = True):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
             }
         )
-        cruises = await _search(request)
-        sample = None
-        for cruise in cruises:
-            it = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-            sailings = cruise.get("sailings") or []
-            if not sailings:
-                continue
-            print(
-                "RC_SAMPLE_CRUISE "
-                + json.dumps({
-                    "id": cruise.get("id"),
-                    "name": it.get("name"),
-                    "ship": (it.get("ship") or {}).get("name"),
-                    "departure": (it.get("departurePort") or {}).get("name"),
-                    "departureCode": (it.get("departurePort") or {}).get("code"),
-                    "nights": it.get("totalNights"),
-                    "sailing": sailings[0],
-                }, separators=(",", ":"))
-            )
-            sample = sailings[0]
-            break
+        cruises = await _search_all(request)
+        records: dict[str, dict] = {}
+        priced_double = 0
+        priced_solo = 0
 
-        if sample:
-            solo = await _price(request, sample, 1)
-            double = await _price(request, sample, 2)
-            print(
-                "RC_OCCUPANCY_RESULT "
-                + json.dumps({"solo_available": solo is not None, "double_available": double is not None})
-            )
-        else:
-            print("RC_NO_SAMPLE_SAILING")
+        for cruise in cruises:
+            itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
+            dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
+            if dep not in PORTS:
+                continue
+            for sailing in cruise.get("sailings") or []:
+                package = _package_code(sailing)
+                sail_date = (sailing.get("sailDate") or sailing.get("startDate") or "")[:10]
+                if not package or not sail_date:
+                    continue
+
+                solo = await _price(request, sailing, 1)
+                double = await _price(request, sailing, 2)
+                if solo:
+                    priced_solo += 1
+                if double:
+                    priced_double += 1
+
+                cruise_id = f"RoyalCaribbean:{package}:{sail_date}"
+                one_interior = _price_value(solo, "interior", "total") or _price_value(solo, "interior", "per_person")
+                two_interior_pp = _price_value(double, "interior", "per_person")
+                two_interior_total = _price_value(double, "interior", "total")
+
+                records[cruise_id] = {
+                    "cruise_id": cruise_id,
+                    "line": "Royal Caribbean",
+                    "name": itinerary.get("name"),
+                    "ship": (itinerary.get("ship") or {}).get("name"),
+                    "departure_port": dep,
+                    "arrival_port": None,
+                    "departure_date": sail_date,
+                    "nights": itinerary.get("totalNights"),
+                    "itinerary": (itinerary.get("destination") or {}).get("name"),
+                    "url": _au_url(cruise, sailing),
+                    "available": bool(solo or double),
+                    "currency": "AUD",
+                    "one_guest_price": one_interior,
+                    "two_guest_pp_price": two_interior_pp,
+                    "two_guest_total": two_interior_total,
+                    "one_guest_interior": one_interior,
+                    "one_guest_oceanview": _price_value(solo, "oceanview", "total") or _price_value(solo, "oceanview", "per_person"),
+                    "one_guest_balcony": _price_value(solo, "balcony", "total") or _price_value(solo, "balcony", "per_person"),
+                    "one_guest_mini_suite": None,
+                    "one_guest_suite": _price_value(solo, "suite", "total") or _price_value(solo, "suite", "per_person"),
+                    "two_guest_interior_pp": two_interior_pp,
+                    "two_guest_oceanview_pp": _price_value(double, "oceanview", "per_person"),
+                    "two_guest_balcony_pp": _price_value(double, "balcony", "per_person"),
+                    "two_guest_mini_suite_pp": None,
+                    "two_guest_suite_pp": _price_value(double, "suite", "per_person"),
+                }
+                print(
+                    f"RC {sail_date} {dep} {itinerary.get('name')} | "
+                    f"solo={'yes' if solo else 'no'} double={'yes' if double else 'no'}"
+                )
+
         await request.dispose()
 
-
-async def collect(headless: bool = True):
-    await diagnostic(headless=headless)
-    raise RuntimeError(
-        "Royal Caribbean API diagnostic complete. Inspect RC_PRICE_EXACT_MATCH / RC_PRICE_NO_EXACT_MATCH before publication."
+    out = sorted(records.values(), key=lambda r: (r.get("departure_date") or "", r.get("name") or ""))
+    if not out:
+        raise RuntimeError("Royal Caribbean collector returned no Sydney/Brisbane sailings")
+    if priced_double == 0:
+        raise RuntimeError("Royal Caribbean collector obtained no exact 2-adult AUD pricing")
+    print(
+        f"Royal Caribbean production result: {len(out)} sailings, "
+        f"{priced_double} with 2-adult pricing, {priced_solo} with solo pricing"
     )
+    return out
