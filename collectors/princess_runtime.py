@@ -13,6 +13,7 @@ from . import princess as base
 
 
 PRICING_PREFIX = "https://gw.api.princess.com/pcl-web/internal/caps/pc/pricing/v1/cruises/"
+PRODUCT_URL = "https://gw.api.princess.com/pcl-web/internal/resdb/p1.0/products"
 META_TO_CABIN = {
     "I": "interior",
     "O": "oceanview",
@@ -75,12 +76,13 @@ def _parse_date_value(value) -> str | None:
 
 
 def _extract_departure_date(data: dict) -> str | None:
-    """Find the voyage start/departure/sail date in Princess pricing data."""
+    """Find the voyage start/departure/sail date in Princess product data."""
     preferred = (
         "departuredate", "departdate", "saildate", "startdate",
         "cruisestartdate", "voyagestartdate", "embarkdate",
+        "embarkationdate", "productstartdate",
     )
-    fallback = []
+    fallback: list[str] = []
 
     def walk(value):
         if isinstance(value, dict):
@@ -185,6 +187,49 @@ async def _capture_pricing_session(context, seed_url: str):
     return headers, captured["payload"]
 
 
+async def _fetch_product_date(context, headers: dict, record: dict, semaphore: asyncio.Semaphore):
+    if record.get("departure_date"):
+        return
+
+    code = _voyage_code(record)
+    if not code:
+        return
+
+    params = {
+        "agencyCountry": "AU",
+        "cruiseType": "C",
+        "voyageStatus": "A",
+        "webDisplay": "Y",
+        "light": "false",
+        "productCode": code,
+        "promoFilter": "all",
+    }
+
+    async with semaphore:
+        try:
+            response = await context.request.get(
+                PRODUCT_URL,
+                params=params,
+                headers=headers,
+                timeout=30000,
+            )
+            if response.status != 200:
+                print(f"Product API {code}: HTTP {response.status}")
+                return
+
+            data = json.loads(await response.text())
+            departure_date = _extract_departure_date(data)
+            if not departure_date:
+                print(f"Princess date {code}: not found in product response")
+                return
+
+            record["departure_date"] = departure_date
+            record["cruise_id"] = base.make_id(code, departure_date)
+            print(f"Princess date {code}: {departure_date}")
+        except Exception as exc:
+            print(f"Product API {code} failed: {exc}")
+
+
 async def _fetch_one_solo(context, headers: dict, template_payload: dict, record: dict, semaphore: asyncio.Semaphore):
     code = _voyage_code(record)
     if not code or record.get("two_guest_interior_pp") is None:
@@ -227,13 +272,6 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
 
-            if not record.get("departure_date"):
-                api_date = _extract_departure_date(data)
-                if api_date:
-                    record["departure_date"] = api_date
-                    record["cruise_id"] = base.make_id(code, api_date)
-                    print(f"Princess date {code}: {api_date}")
-
             print(
                 f"Solo API {code}: Interior {prices.get('interior')} | "
                 f"Balcony {prices.get('balcony')} | Suite {prices.get('suite')}"
@@ -242,8 +280,9 @@ async def _fetch_one_solo(context, headers: dict, template_payload: dict, record
             print(f"Solo API {code} failed: {exc}")
 
 
-async def _populate_solo_prices(records: list[dict], headless: bool):
+async def _enrich_records(records: list[dict], headless: bool):
     priced = [r for r in records if r.get("two_guest_interior_pp") is not None and _voyage_code(r)]
+    coded = [r for r in records if _voyage_code(r)]
     if not priced:
         return
 
@@ -274,9 +313,17 @@ async def _populate_solo_prices(records: list[dict], headless: bool):
         await context.route(base.LOCALE_URL, force_locale)
         headers, template_payload = await _capture_pricing_session(context, seed_url)
 
-        semaphore = asyncio.Semaphore(6)
+        date_semaphore = asyncio.Semaphore(8)
+        solo_semaphore = asyncio.Semaphore(6)
+
         await asyncio.gather(*(
-            _fetch_one_solo(context, headers, template_payload, record, semaphore)
+            _fetch_product_date(context, headers, record, date_semaphore)
+            for record in coded
+            if not record.get("departure_date")
+        ))
+
+        await asyncio.gather(*(
+            _fetch_one_solo(context, headers, template_payload, record, solo_semaphore)
             for record in priced
         ))
 
@@ -285,8 +332,8 @@ async def _populate_solo_prices(records: list[dict], headless: bool):
 
 async def collect(headless: bool = True):
     # Keep the proven 2-person browser scrape untouched. Disable the unreliable
-    # guest-picker path, then enrich those records with Princess's own one-person
-    # pricing API using the authenticated/session headers captured from the page.
+    # guest-picker path, then enrich records with Princess's product dates and
+    # one-person pricing API using the authenticated/session headers from the page.
     original_set_guest = base.set_guest_count_on_detail
     base.set_guest_count_on_detail = _disable_page_solo
     try:
@@ -308,10 +355,17 @@ async def collect(headless: bool = True):
             "Refusing to overwrite the live dashboard."
         )
 
-    await _populate_solo_prices(records, headless=headless)
+    await _enrich_records(records, headless=headless)
 
+    dated = sum(1 for r in records if r.get("departure_date"))
     solo_priced = sum(1 for r in records if r.get("one_guest_interior") is not None)
+    print(f"Princess departure dates captured for {dated}/{len(records)} cruises.")
     print(f"Princess solo Interior pricing captured for {solo_priced}/{len(records)} cruises.")
+
+    if dated == 0:
+        raise RuntimeError(
+            "Princess returned no departure dates. Refusing to publish undated cruise data."
+        )
 
     if solo_priced == 0:
         raise RuntimeError(
