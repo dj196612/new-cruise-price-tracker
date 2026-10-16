@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 
 from playwright.async_api import async_playwright
 
@@ -9,134 +8,100 @@ from . import princess as base
 
 
 TEST_URL = "https://www.princess.com/itinerary-details?voyageCode=A716A"
-WATCH_RE = re.compile(r"pricing|fare|guest|occup|room|booking|quote|availability|caps|ube", re.I)
+PRICING_URL = "https://gw.api.princess.com/pcl-web/internal/caps/pc/pricing/v1/cruises/A716A"
 
 
-async def _first_visible(locator):
-    for i in range(await locator.count()):
-        item = locator.nth(i)
-        try:
-            if await item.is_visible():
-                return item
-        except Exception:
-            pass
-    return None
+def _payload(guest_count: int, fare_type: str = "BESTVALUE") -> dict:
+    return {
+        "booking": {
+            "currencyCode": "AUD",
+            "guests": [
+                {"country": "AU", "homeCity": "SYD"}
+                for _ in range(guest_count)
+            ],
+            "promos": [],
+            "couponCodes": [],
+            "bookingAgency": {
+                "id": "DIRECTAU",
+                "bookingCompany": "PA",
+                "currency": "AUD",
+                "country": "AU",
+            },
+        },
+        "filters": {
+            "availabilities": ["Y", "G", "B"],
+            "cruises": [],
+            "cruiseType": "C",
+            "meta": "I",
+            "itinPorts": [],
+            "subTrades": [],
+        },
+        "leadInBy": "itins",
+        "retrieveFlags": {
+            "additionalGuestFare": True,
+            "averageFare": False,
+            "brochureFare": False,
+            "averageBrochureFare": True,
+            "includeMisc": False,
+            "fareType": fare_type,
+            "roundUpFare": True,
+            "subMeta": True,
+            "zones": True,
+            "includeTfpe": True,
+        },
+    }
 
 
-async def _storage(page):
-    try:
-        return await page.evaluate(
-            """() => ({
-                local: Object.fromEntries(Object.entries(localStorage)),
-                session: Object.fromEntries(Object.entries(sessionStorage))
-            })"""
-        )
-    except Exception as exc:
-        return {"error": str(exc)}
+def _summarise(data: dict) -> dict:
+    out = {"currency": None, "fare_types": {}}
+    for product in data.get("products", []):
+        for cruise in product.get("cruises", []):
+            pricing = cruise.get("pricing") or {}
+            out["currency"] = pricing.get("fareCurrency") or out["currency"]
+            for fare in pricing.get("fares", []):
+                fare_type = fare.get("fareType") or "UNKNOWN"
+                cats = []
+                for category in fare.get("categories", []):
+                    guests = category.get("guests") or []
+                    cats.append({
+                        "category": category.get("id"),
+                        "status": category.get("status"),
+                        "fare_guest_1": guests[0].get("fare") if guests else None,
+                        "base_guest_1": guests[0].get("baseFare") if guests else None,
+                        "ssv_guest_1": guests[0].get("ssv") if guests else None,
+                        "minimum": category.get("minimum"),
+                        "maximum": category.get("maximum"),
+                    })
+                out["fare_types"][fare_type] = cats
+    return out
 
 
-async def _dump_cookies(context, label: str):
-    cookies = await context.cookies()
-    interesting = []
-    for c in cookies:
-        n = (c.get("name") or "").lower()
-        if any(k in n for k in ("guest", "room", "occup", "book", "fare", "cruise", "geo", "country", "ube")):
-            interesting.append(f"{c.get('name')}={c.get('value')}")
-    print(f"SOLO_DIAG_{label}_COOKIES " + " | ".join(interesting))
-
-
-async def _click_one_guest(page) -> bool:
-    current = await _first_visible(
-        page.get_by_text(re.compile(r"1\s*room\s*/\s*\d+\s*guests?", re.I))
+async def _api_post(page, payload: dict) -> dict:
+    result = await page.evaluate(
+        """async ({url, payload}) => {
+            const response = await fetch(url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'content-type': 'application/json',
+                    'accept': 'application/json, text/plain, */*'
+                },
+                body: JSON.stringify(payload)
+            });
+            const text = await response.text();
+            return {status: response.status, text};
+        }""",
+        {"url": PRICING_URL, "payload": payload},
     )
-    if current is None:
-        print("SOLO_DIAG guest control not found")
-        return False
-
-    await current.click(timeout=3000, force=True)
-    await page.wait_for_timeout(500)
-
-    clicked = False
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"(decrease|decrement|minus|remove).*(adult|guest)", re.I)),
-        page.get_by_role("button", name=re.compile(r"(adult|guest).*(decrease|decrement|minus|remove)", re.I)),
-        page.locator('button[aria-label*="decrease" i]'),
-        page.locator('button[aria-label*="decrement" i]'),
-        page.locator('button[aria-label*="minus" i]'),
-        page.locator('button[title*="decrease" i]'),
-    ]
-    for loc in candidates:
-        button = await _first_visible(loc)
-        if button is None:
-            continue
-        try:
-            print("SOLO_DIAG clicking decrement:", await button.get_attribute("aria-label"), await button.get_attribute("title"))
-            await button.click(timeout=2500, force=True)
-            clicked = True
-            break
-        except Exception:
-            pass
-
-    if not clicked:
-        adults = await _first_visible(page.get_by_text(re.compile(r"^Adults?$", re.I)))
-        if adults is not None:
-            node = adults
-            for depth in range(6):
-                try:
-                    node = node.locator("xpath=..")
-                    buttons = node.locator("button")
-                    visible = []
-                    for i in range(await buttons.count()):
-                        b = buttons.nth(i)
-                        if await b.is_visible() and await b.is_enabled():
-                            visible.append(b)
-                    if len(visible) >= 2:
-                        print(f"SOLO_DIAG clicking Adults-row first button at depth {depth + 1}")
-                        await visible[0].click(timeout=2500, force=True)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-    if not clicked:
-        print("SOLO_DIAG decrement not found")
-        return False
-
-    # Log panel text before applying, because it often reveals the internal count.
-    try:
-        body = " ".join((await page.locator("body").inner_text()).split())
-        m = re.search(r"Adults.{0,120}", body, re.I)
-        if m:
-            print("SOLO_DIAG_ADULTS_TEXT", m.group(0))
-    except Exception:
-        pass
-
-    for label in (r"^Apply$", r"^Done$", r"^Save$", r"^Update$", r"^Continue$"):
-        button = await _first_visible(page.get_by_role("button", name=re.compile(label, re.I)))
-        if button is not None:
-            try:
-                print("SOLO_DIAG applying guest change with", await button.inner_text())
-                await button.click(timeout=2500, force=True)
-                break
-            except Exception:
-                pass
-
-    for _ in range(20):
-        try:
-            text = " ".join((await page.locator("body").inner_text()).split())
-            if re.search(r"1\s*room\s*/\s*1\s*guest", text, re.I):
-                print("SOLO_DIAG occupancy confirmed: 1 room / 1 guest")
-                return True
-        except Exception:
-            pass
-        await page.wait_for_timeout(500)
-
-    print("SOLO_DIAG occupancy did not confirm")
-    return False
+    print("SOLO_API_STATUS", result["status"])
+    if result["status"] != 200:
+        print("SOLO_API_ERROR_BODY", result["text"][:6000])
+        return {}
+    return json.loads(result["text"])
 
 
 async def collect(headless: bool = True):
-    print("Running one-voyage Princess solo network diagnostic for A716A")
+    print("Running direct Princess one-guest pricing API diagnostic for A716A")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -152,59 +117,31 @@ async def collect(headless: bool = True):
         ])
 
         async def force_locale(route):
-            await route.fulfill(status=200, content_type="application/json", body=json.dumps(base.AU_LOCALE))
-
-        await context.route(base.LOCALE_URL, force_locale)
-
-        page = await context.new_page()
-        phase = {"value": "LOAD"}
-
-        def on_request(request):
-            if not WATCH_RE.search(request.url):
-                return
-            try:
-                post = request.post_data or ""
-            except Exception:
-                post = ""
-            # Limit large payloads while preserving all occupancy-related content.
-            if len(post) > 5000:
-                post = post[:5000] + "...<truncated>"
-            print(
-                f"SOLO_DIAG_REQ_{phase['value']} method={request.method} url={request.url} post={post}"
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(base.AU_LOCALE),
             )
 
-        async def on_response(response):
-            if not WATCH_RE.search(response.url):
-                return
-            print(f"SOLO_DIAG_RESP_{phase['value']} status={response.status} url={response.url}")
-
-        page.on("request", on_request)
-        page.on("response", on_response)
-
+        await context.route(base.LOCALE_URL, force_locale)
+        page = await context.new_page()
         await page.goto(TEST_URL, wait_until="domcontentloaded", timeout=90000)
         await base.dismiss_noise(page)
         body = await base.wait_for_cabin_prices(page, 25)
-        print("SOLO_DIAG_2P_PRICES", json.dumps(base.cabin_prices(body), sort_keys=True))
-        print("SOLO_DIAG_STORAGE_BEFORE", json.dumps(await _storage(page), sort_keys=True)[:12000])
-        await _dump_cookies(context, "BEFORE")
+        print("SOLO_API_VISIBLE_2P", json.dumps(base.cabin_prices(body), sort_keys=True))
 
-        phase["value"] = "GUEST_CHANGE"
-        ok = await _click_one_guest(page)
-        print("SOLO_DIAG_GUEST_CHANGE_OK", ok)
-        await page.wait_for_timeout(8000)
+        two_bestvalue = await _api_post(page, _payload(2, "BESTVALUE"))
+        print("SOLO_API_2P_BESTVALUE", json.dumps(_summarise(two_bestvalue), sort_keys=True)[:20000])
 
-        try:
-            body_after = " ".join((await page.locator("body").inner_text()).split())
-            print("SOLO_DIAG_1P_VISIBLE_PRICES", json.dumps(base.cabin_prices(body_after), sort_keys=True))
-        except Exception as exc:
-            print("SOLO_DIAG_1P_VISIBLE_ERROR", exc)
+        one_bestvalue = await _api_post(page, _payload(1, "BESTVALUE"))
+        print("SOLO_API_1P_BESTVALUE", json.dumps(_summarise(one_bestvalue), sort_keys=True)[:20000])
 
-        print("SOLO_DIAG_STORAGE_AFTER", json.dumps(await _storage(page), sort_keys=True)[:12000])
-        await _dump_cookies(context, "AFTER")
+        one_bestfare = await _api_post(page, _payload(1, "BESTFARE"))
+        print("SOLO_API_1P_BESTFARE", json.dumps(_summarise(one_bestfare), sort_keys=True)[:20000])
 
         await page.close()
         await browser.close()
 
     raise RuntimeError(
-        "Princess solo diagnostic complete. Inspect SOLO_DIAG_REQ_GUEST_CHANGE and storage/cookie deltas."
+        "Princess one-guest API diagnostic complete. Inspect SOLO_API_1P_BESTVALUE and SOLO_API_1P_BESTFARE."
     )
