@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlencode
+from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 SEARCH_API = "https://www.carnival.com.au/cruisesearch/api/search"
+BOOK_API = "https://www.carnival.com.au/booking-api/api/v1.0/book"
 PORTS = ("SYD", "BNE", "MEL")
 PAGE_SIZE = 50
+BOOKING_CONCURRENCY = 6
+
+CABIN_CODES = {
+    "IS": "interior",
+    "OS": "oceanview",
+    "OB": "balcony",
+    "SU": "suite",
+}
 
 
 def _headers() -> dict[str, str]:
@@ -19,7 +28,7 @@ def _headers() -> dict[str, str]:
     }
 
 
-async def _get_json(request, *, port: str, guests: int, senior: bool, page: int) -> dict | None:
+async def _get_json(request, *, port: str, guests: int, page: int) -> dict | None:
     params = {
         "pageNumber": str(page),
         "numadults": str(guests),
@@ -31,7 +40,7 @@ async def _get_json(request, *, port: str, guests: int, senior: bool, page: int)
         "currency": "AUD",
         "locality": "7",
         "client": "cruisesearch",
-        "senior": "true" if senior else "false",
+        "senior": "false",
     }
     for attempt in range(1, 3):
         try:
@@ -39,7 +48,7 @@ async def _get_json(request, *, port: str, guests: int, senior: bool, page: int)
             if response.status != 200:
                 print(
                     f"Carnival search HTTP {response.status} port={port} guests={guests} "
-                    f"senior={senior} page={page} attempt={attempt}/2"
+                    f"page={page} attempt={attempt}/2"
                 )
                 if attempt < 2:
                     await asyncio.sleep(1.5)
@@ -48,67 +57,28 @@ async def _get_json(request, *, port: str, guests: int, senior: bool, page: int)
             return await response.json()
         except PlaywrightTimeoutError:
             print(
-                f"Carnival search timeout port={port} guests={guests} senior={senior} "
+                f"Carnival search timeout port={port} guests={guests} "
                 f"page={page} attempt={attempt}/2"
             )
             if attempt < 2:
                 await asyncio.sleep(1.5)
         except Exception as exc:
             print(
-                f"Carnival search error port={port} guests={guests} senior={senior} "
-                f"page={page}: {type(exc).__name__}: {exc}"
+                f"Carnival search error port={port} guests={guests} page={page}: "
+                f"{type(exc).__name__}: {exc}"
             )
             return None
     return None
 
 
-def _room_prices(sailing: dict) -> dict[str, float | None]:
-    out = {"interior": None, "oceanview": None, "balcony": None, "suite": None}
-    rooms = sailing.get("rooms") or {}
-    for source, target in (
-        ("interior", "interior"),
-        ("oceanview", "oceanview"),
-        ("balcony", "balcony"),
-        ("suite", "suite"),
-    ):
-        room = rooms.get(source) or {}
-        if room.get("soldOut"):
-            continue
-        if (room.get("priceCurrency") or "AUD").upper() != "AUD":
-            continue
-        value = room.get("price")
-        if isinstance(value, (int, float)):
-            out[target] = float(value)
-    return out
-
-
-def _merge_lower(current: dict | None, candidate: dict, senior: bool) -> dict:
-    if current is None:
-        return {
-            "prices": _room_prices(candidate),
-            "sailing": candidate,
-            "senior_used": {k: senior for k, v in _room_prices(candidate).items() if v is not None},
-        }
-
-    cand_prices = _room_prices(candidate)
-    for cabin, cand in cand_prices.items():
-        if cand is None:
-            continue
-        cur = current["prices"].get(cabin)
-        if cur is None or cand < cur:
-            current["prices"][cabin] = cand
-            current["senior_used"][cabin] = senior
-    return current
-
-
-async def _collect_offer_set(request, *, port: str, guests: int, senior: bool) -> tuple[dict[str, dict], dict[str, dict]]:
+async def _collect_catalogue(request, *, port: str, guests: int) -> tuple[dict[str, dict], dict[str, dict]]:
     sailings: dict[str, dict] = {}
     itineraries: dict[str, dict] = {}
     page = 1
     last_page = 1
 
     while page <= last_page:
-        body = await _get_json(request, port=port, guests=guests, senior=senior, page=page)
+        body = await _get_json(request, port=port, guests=guests, page=page)
         if not body:
             break
         results = body.get("results") or {}
@@ -127,15 +97,145 @@ async def _collect_offer_set(request, *, port: str, guests: int, senior: bool) -
                 if not sail_id or not sail_date:
                     continue
                 key = f"{code}:{sail_id}:{sail_date}"
-                sailings[key] = _merge_lower(sailings.get(key), sailing, senior)
+                sailings[key] = sailing
 
         print(
-            f"Carnival port={port} guests={guests} senior={senior} page={page}/{last_page}: "
+            f"Carnival catalogue port={port} guests={guests} page={page}/{last_page}: "
             f"{len(rows)} itineraries, {len(sailings)} sailings"
         )
         page += 1
 
     return sailings, itineraries
+
+
+def _payload(*, sailing: dict, itin: dict, guests: int) -> dict:
+    sail_date = (sailing.get("departureDate") or "")[:10]
+    duration = int(itin.get("dur") or 0)
+    ship_code = (itin.get("shipCode") or "").strip()
+    sailing_id = int(sailing.get("sailingId"))
+
+    return {
+        "sailingId": sailing_id,
+        "sailDate": sail_date,
+        "durationDays": duration,
+        "shipCode": ship_code,
+        "currencyCode": "AUD",
+        "cabins": [
+            {
+                "qualifiers": {
+                    "numberOfGuests": guests,
+                    "countryOfResidency": "AU",
+                    "isMilitary": False,
+                    "isSenior": True,
+                    "isPastGuest": False,
+                    "pastGuestNumber": None,
+                    "stateOfResidency": None,
+                    "accessibility": None,
+                    "tierCode": None,
+                    "couponCode": None,
+                },
+                "metaCode": None,
+                "phantomMetaCode": None,
+                "stateroomTypeCode": None,
+                "rateCode": None,
+                "price": None,
+                "deckCode": None,
+                "locationCode": None,
+                "roomNumber": None,
+                "cabinToRelease": None,
+                "categoryCode": None,
+                "upgradeFrom": None,
+            }
+        ],
+        "flowOption": None,
+        "currentCabinIndex": 0,
+        "preselectedMetaCode": None,
+        "sortMetasByAscPrice": False,
+        "encryptedBookingNumber": None,
+        "connectingCabinsIndicator": False,
+        "previousCabinSelectedCategoryCode": None,
+        "previousCabinSelectedRateCode": None,
+    }
+
+
+def _booking_prices(body: dict, guests: int) -> dict[str, float | None]:
+    out = {"interior": None, "oceanview": None, "balcony": None, "suite": None}
+    cabins = body.get("cabins") or []
+    if not cabins:
+        return out
+
+    options = (cabins[0].get("options") or {}).get("metas") or []
+    for meta in options:
+        target = CABIN_CODES.get((meta.get("code") or "").upper())
+        if not target or meta.get("isSoldOut"):
+            continue
+
+        value = meta.get("selfServiceDisplayPrice")
+        if not isinstance(value, (int, float)):
+            value = meta.get("price")
+
+        if not isinstance(value, (int, float)):
+            guest_rows = ((meta.get("priceDetails") or {}).get("guestPrices") or [])
+            guest_values = [x.get("price") for x in guest_rows if isinstance(x.get("price"), (int, float))]
+            if guest_values:
+                value = sum(float(x) for x in guest_values) / max(guests, 1)
+
+        if isinstance(value, (int, float)):
+            out[target] = float(value)
+
+    return out
+
+
+async def _booking_price_set(request, semaphore: asyncio.Semaphore, *, sailing: dict, itin: dict, guests: int) -> dict[str, float | None]:
+    payload = _payload(sailing=sailing, itin=itin, guests=guests)
+    sail_id = sailing.get("sailingId")
+    sail_date = (sailing.get("departureDate") or "")[:10]
+    headers = {
+        **_headers(),
+        "accept": "application/json",
+        "content-type": "application/json",
+        "referer": "https://www.carnival.com.au/booking/qualifiers",
+    }
+
+    async with semaphore:
+        for attempt in range(1, 3):
+            try:
+                response = await request.post(BOOK_API, data=payload, headers=headers, timeout=30000)
+                if response.status != 200:
+                    print(
+                        f"Carnival booking HTTP {response.status} sailing={sail_id} date={sail_date} "
+                        f"guests={guests} attempt={attempt}/2"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise RuntimeError(
+                        f"Carnival booking API failed for sailing {sail_id} {sail_date}, guests={guests}: HTTP {response.status}"
+                    )
+
+                body = await response.json()
+                prices = _booking_prices(body, guests)
+                if not any(v is not None for v in prices.values()):
+                    raise RuntimeError(
+                        f"Carnival booking API returned no cabin prices for sailing {sail_id} {sail_date}, guests={guests}"
+                    )
+                return prices
+            except PlaywrightTimeoutError:
+                print(
+                    f"Carnival booking timeout sailing={sail_id} date={sail_date} "
+                    f"guests={guests} attempt={attempt}/2"
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
+
+    raise RuntimeError(f"Carnival booking API exhausted retries for sailing {sail_id} {sail_date}, guests={guests}")
 
 
 def _absolute_url(path: str | None) -> str:
@@ -155,14 +255,10 @@ def _itinerary_text(itin: dict) -> str:
     return " · ".join(names)
 
 
-def _choose_url(itin: dict, sailing: dict, guests: int, senior_flags: dict[str, bool]) -> str:
-    if any(senior_flags.values()):
-        url = sailing.get("sailingURL")
-        if url:
-            if "isOver55=N" in url:
-                url = url.replace("isOver55=N", "isOver55=Y")
-            return _absolute_url(url)
+def _booking_url(itin: dict, sailing: dict) -> str:
     url = sailing.get("sailingURL") or itin.get("itineraryURLWithSailing") or itin.get("itineraryURL")
+    if url and "isOver55=N" in url:
+        url = url.replace("isOver55=N", "isOver55=Y")
     return _absolute_url(url)
 
 
@@ -170,58 +266,41 @@ async def collect(headless: bool = True) -> list[dict]:
     del headless
     async with async_playwright() as p:
         request = await p.request.new_context(extra_http_headers=_headers())
+        semaphore = asyncio.Semaphore(BOOKING_CONCURRENCY)
 
         records: dict[str, dict] = {}
         priced_solo = 0
         priced_double = 0
 
         for port in PORTS:
-            one_std, one_itins = await _collect_offer_set(request, port=port, guests=1, senior=False)
-            one_sen, one_sen_itins = await _collect_offer_set(request, port=port, guests=1, senior=True)
-            two_std, two_itins = await _collect_offer_set(request, port=port, guests=2, senior=False)
-            two_sen, two_sen_itins = await _collect_offer_set(request, port=port, guests=2, senior=True)
-
-            one = one_std
-            for key, row in one_sen.items():
-                if key not in one:
-                    one[key] = row
-                else:
-                    for cabin, value in row["prices"].items():
-                        cur = one[key]["prices"].get(cabin)
-                        if value is not None and (cur is None or value < cur):
-                            one[key]["prices"][cabin] = value
-                            one[key]["senior_used"][cabin] = True
-
-            two = two_std
-            for key, row in two_sen.items():
-                if key not in two:
-                    two[key] = row
-                else:
-                    for cabin, value in row["prices"].items():
-                        cur = two[key]["prices"].get(cabin)
-                        if value is not None and (cur is None or value < cur):
-                            two[key]["prices"][cabin] = value
-                            two[key]["senior_used"][cabin] = True
+            one_catalogue, one_itins = await _collect_catalogue(request, port=port, guests=1)
+            two_catalogue, two_itins = await _collect_catalogue(request, port=port, guests=2)
 
             all_itins = {}
             all_itins.update(one_itins)
-            all_itins.update(one_sen_itins)
             all_itins.update(two_itins)
-            all_itins.update(two_sen_itins)
 
-            keys = sorted(set(one) | set(two))
-            for key in keys:
+            catalogue = dict(two_catalogue)
+            catalogue.update(one_catalogue)
+            keys = sorted(catalogue)
+
+            async def price_one(key: str):
                 code = key.split(":", 1)[0]
                 itin = all_itins.get(code) or {}
-                solo_row = one.get(key)
-                double_row = two.get(key)
-                source = (double_row or solo_row or {}).get("sailing") or {}
+                sailing = catalogue[key]
+                solo_task = _booking_price_set(request, semaphore, sailing=sailing, itin=itin, guests=1)
+                double_task = _booking_price_set(request, semaphore, sailing=sailing, itin=itin, guests=2)
+                solo, double = await asyncio.gather(solo_task, double_task)
+                return key, itin, sailing, solo, double
+
+            results = await asyncio.gather(*(price_one(key) for key in keys))
+
+            for key, itin, source, solo, double in results:
+                code = key.split(":", 1)[0]
                 sail_date = (source.get("departureDate") or "")[:10]
                 if not sail_date:
                     continue
 
-                solo = (solo_row or {}).get("prices") or {"interior": None, "oceanview": None, "balcony": None, "suite": None}
-                double = (double_row or {}).get("prices") or {"interior": None, "oceanview": None, "balcony": None, "suite": None}
                 if any(v is not None for v in solo.values()):
                     priced_solo += 1
                 if any(v is not None for v in double.values()):
@@ -229,9 +308,6 @@ async def collect(headless: bool = True) -> list[dict]:
 
                 sailing_id = str(source.get("sailingId") or "")
                 cruise_id = f"Carnival:{code}:{sailing_id}:{sail_date}"
-                senior_flags = {}
-                senior_flags.update((solo_row or {}).get("senior_used") or {})
-                senior_flags.update((double_row or {}).get("senior_used") or {})
 
                 records[cruise_id] = {
                     "cruise_id": cruise_id,
@@ -243,10 +319,10 @@ async def collect(headless: bool = True) -> list[dict]:
                     "departure_date": sail_date,
                     "nights": itin.get("dur"),
                     "itinerary": _itinerary_text(itin),
-                    "url": _choose_url(itin, source, 2, senior_flags),
+                    "url": _booking_url(itin, source),
                     "available": any(v is not None for v in solo.values()) or any(v is not None for v in double.values()),
                     "currency": "AUD",
-                    "fare_basis": "Carnival Fare (best of Standard / 55+)",
+                    "fare_basis": "Carnival bookable fare (best available incl. 55+)",
                     "one_guest_price": solo.get("interior"),
                     "two_guest_pp_price": double.get("interior"),
                     "two_guest_total": double.get("interior") * 2 if double.get("interior") is not None else None,
@@ -262,16 +338,18 @@ async def collect(headless: bool = True) -> list[dict]:
                     "two_guest_suite_pp": double.get("suite"),
                 }
 
+            print(f"Carnival booking pricing completed for port={port}: {len(results)} sailings")
+
         await request.dispose()
 
     out = sorted(records.values(), key=lambda r: (r.get("departure_date") or "", r.get("departure_port") or "", r.get("name") or ""))
     if not out:
         raise RuntimeError("Carnival collector returned no Australian sailings")
     if priced_double == 0:
-        raise RuntimeError("Carnival collector obtained no 2-guest AUD pricing")
+        raise RuntimeError("Carnival collector obtained no 2-guest AUD booking pricing")
 
     print(
         f"Carnival production result: {len(out)} sailings, "
-        f"{priced_double} with 2-guest pricing, {priced_solo} with solo pricing"
+        f"{priced_double} with 2-guest booking pricing, {priced_solo} with solo booking pricing"
     )
     return out
