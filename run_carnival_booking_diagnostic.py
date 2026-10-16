@@ -60,17 +60,20 @@ async def _find_sailing(request):
 
 
 async def _click_continue(page, stage: str):
-    for selector in (
-        "button:has-text('CONTINUE')",
-        "button:has-text('Continue')",
-        "button:has-text('Next')",
-        "button:has-text('View Rates')",
-    ):
+    buttons = page.locator("button")
+    for i in range(await buttons.count()):
         try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=1200):
+            btn = buttons.nth(i)
+            text = " ".join((await btn.inner_text()).split()).strip().upper()
+            if text not in {"CONTINUE", "NEXT", "VIEW RATES"}:
+                continue
+            if not await btn.is_visible():
+                continue
+            enabled = await btn.is_enabled()
+            print(f"CARNIVAL_BOOKING_BUTTON stage={stage} text={text} enabled={enabled}")
+            if enabled:
                 await btn.click()
-                print(f"CARNIVAL_BOOKING_CLICK stage={stage} selector={selector}")
+                print(f"CARNIVAL_BOOKING_CLICK stage={stage} text={text}")
                 await page.wait_for_timeout(7000)
                 return True
         except Exception:
@@ -79,13 +82,62 @@ async def _click_continue(page, stage: str):
     return False
 
 
+async def _apply_senior(page):
+    label = page.locator("label").filter(has_text="55+ years old").first
+    try:
+        if await label.is_visible(timeout=3000):
+            checkbox = label.locator("input[type='checkbox']").first
+            if await checkbox.count():
+                if not await checkbox.is_checked():
+                    await checkbox.check(force=True)
+                checked = await checkbox.is_checked()
+                print(f"CARNIVAL_BOOKING_55_PLUS_CHECKED checked={checked}")
+                return checked
+
+            # Some Carnival builds render the input adjacent to the label.
+            nearby = label.locator("xpath=preceding::input[@type='checkbox'][1]")
+            if await nearby.count():
+                if not await nearby.is_checked():
+                    await nearby.check(force=True)
+                checked = await nearby.is_checked()
+                print(f"CARNIVAL_BOOKING_55_PLUS_CHECKED checked={checked}")
+                return checked
+
+            await label.click(force=True)
+            await page.wait_for_timeout(1000)
+            print("CARNIVAL_BOOKING_55_PLUS_LABEL_CLICKED")
+            return True
+    except Exception as exc:
+        print(f"CARNIVAL_BOOKING_55_PLUS_ERROR {type(exc).__name__}: {exc}")
+
+    # Last-resort DOM probe: find the checkbox whose surrounding text contains 55+.
+    try:
+        result = await page.evaluate("""
+        () => {
+          for (const input of document.querySelectorAll('input[type=checkbox]')) {
+            const text = ((input.closest('label')?.innerText || '') + ' ' + (input.parentElement?.innerText || '')).trim();
+            if (text.includes('55+ years old')) {
+              input.click();
+              return {found:true, checked:input.checked, text};
+            }
+          }
+          return {found:false};
+        }
+        """)
+        print("CARNIVAL_BOOKING_55_PLUS_DOM " + json.dumps(result, separators=(",", ":")))
+        return bool(result.get("found") and result.get("checked"))
+    except Exception as exc:
+        print(f"CARNIVAL_BOOKING_55_PLUS_DOM_ERROR {type(exc).__name__}: {exc}")
+        return False
+
+
 async def _probe_booking(browser, sailing_url: str):
     page = await browser.new_page(locale="en-AU")
     captured = []
 
     async def on_response(response):
         try:
-            if len(captured) >= 80:
+            if len(captured) >= 100:
                 return
             parsed = urlparse(response.url)
             if not parsed.netloc.endswith("carnival.com.au"):
@@ -100,7 +152,7 @@ async def _probe_booking(browser, sailing_url: str):
             if "json" in content_type:
                 try:
                     text = await response.text()
-                    item["body"] = " ".join(text.split())[:18000]
+                    item["body"] = " ".join(text.split())[:24000]
                 except Exception as exc:
                     item["body_error"] = f"{type(exc).__name__}: {exc}"
             captured.append(item)
@@ -114,28 +166,10 @@ async def _probe_booking(browser, sailing_url: str):
     print(f"CARNIVAL_BOOKING_STATUS {response.status if response else 'none'} final={page.url}")
     await page.wait_for_timeout(7000)
 
-    # Rooms/Guests -> Rate Qualifiers.
     await _click_continue(page, "rooms-guests")
-
-    # Apply the same eligible 55+ qualifier the tracker is intended to use.
-    senior_applied = False
-    for selector in (
-        "label:has-text('55+ years old')",
-        "text=55+ years old",
-    ):
-        try:
-            loc = page.locator(selector).first
-            if await loc.is_visible(timeout=1200):
-                await loc.click()
-                senior_applied = True
-                print("CARNIVAL_BOOKING_55_PLUS_APPLIED")
-                break
-        except Exception:
-            pass
-    if not senior_applied:
-        print("CARNIVAL_BOOKING_55_PLUS_NOT_FOUND")
-
-    # Rate Qualifiers -> Room Category.
+    senior_ok = await _apply_senior(page)
+    print(f"CARNIVAL_BOOKING_55_PLUS_RESULT {senior_ok}")
+    await page.wait_for_timeout(1500)
     await _click_continue(page, "rate-qualifiers")
 
     body = " ".join((await page.locator("body").inner_text(timeout=5000)).split())
