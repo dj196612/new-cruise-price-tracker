@@ -59,7 +59,38 @@ async def _find_sailing(request):
     raise RuntimeError("Target Carnival sailing not found")
 
 
+async def _dismiss_cookie_overlay(page):
+    for selector in (
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Accept All Cookies')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept')",
+    ):
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible(timeout=1200):
+                await btn.click(force=True)
+                print(f"CARNIVAL_COOKIE_DISMISSED selector={selector}")
+                await page.wait_for_timeout(1000)
+                return True
+        except Exception:
+            pass
+
+    try:
+        visible = await page.locator("#onetrust-consent-sdk").is_visible(timeout=800)
+        if visible:
+            await page.locator("#onetrust-consent-sdk").evaluate("el => el.remove()")
+            print("CARNIVAL_COOKIE_OVERLAY_REMOVED")
+            return True
+    except Exception:
+        pass
+
+    print("CARNIVAL_COOKIE_OVERLAY_NOT_PRESENT")
+    return False
+
+
 async def _click_continue(page, stage: str):
+    await _dismiss_cookie_overlay(page)
     buttons = page.locator("button")
     for i in range(await buttons.count()):
         try:
@@ -135,7 +166,7 @@ async def _probe_booking(browser, sailing_url: str):
 
     async def on_response(response):
         try:
-            if len(captured) >= 100:
+            if len(captured) >= 120:
                 return
             parsed = urlparse(response.url)
             if not parsed.netloc.endswith("carnival.com.au"):
@@ -150,7 +181,7 @@ async def _probe_booking(browser, sailing_url: str):
             if "json" in content_type:
                 try:
                     text = await response.text()
-                    item["body"] = " ".join(text.split())[:24000]
+                    item["body"] = " ".join(text.split())[:30000]
                 except Exception as exc:
                     item["body_error"] = f"{type(exc).__name__}: {exc}"
             captured.append(item)
@@ -164,6 +195,7 @@ async def _probe_booking(browser, sailing_url: str):
     print(f"CARNIVAL_BOOKING_STATUS {response.status if response else 'none'} final={page.url}")
     await page.wait_for_timeout(7000)
 
+    await _dismiss_cookie_overlay(page)
     await _click_continue(page, "rooms-guests")
     senior_ok = await _apply_senior(page)
     print(f"CARNIVAL_BOOKING_55_PLUS_RESULT {senior_ok}")
@@ -172,7 +204,7 @@ async def _probe_booking(browser, sailing_url: str):
 
     body = " ".join((await page.locator("body").inner_text(timeout=5000)).split())
     print(f"CARNIVAL_BOOKING_FINAL_URL {page.url}")
-    print(f"CARNIVAL_BOOKING_BODY {body[:12000]}")
+    print(f"CARNIVAL_BOOKING_BODY {body[:14000]}")
 
     seen = set()
     for item in captured:
