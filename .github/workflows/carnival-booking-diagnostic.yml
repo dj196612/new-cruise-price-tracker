@@ -1,0 +1,47 @@
+name: Carnival Booking Price Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carnival-booking-price-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run targeted Carnival booking diagnostic
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_carnival_booking_diagnostic.py 2>&1 | tee carnival-booking-diagnostic.txt
+
+      - name: Upload diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carnival-booking-diagnostic
+          path: carnival-booking-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 3
