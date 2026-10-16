@@ -3,8 +3,12 @@ name: Celebrity Cruise Tracker
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "40 6,18 * * *"
+      timezone: "Australia/Sydney"
+
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: celebrity-cruise-tracker
@@ -13,7 +17,7 @@ concurrency:
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -30,5 +34,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Celebrity diagnostic
+      - name: Run Celebrity tracker
         run: python run_celebrity.py
+
+      - name: Commit updated cruise data
+        run: |
+          git config user.name "cruise-tracker-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/cruises.db data/latest.json
+          git diff --cached --quiet || git commit -m "Update Celebrity cruise prices"
+          git push
