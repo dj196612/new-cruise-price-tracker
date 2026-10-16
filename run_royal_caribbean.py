@@ -1,6 +1,7 @@
 import asyncio
 
 from collectors.royal_caribbean import collect
+from collectors.solo_repair import repair_missing_solo
 from export_json import main as export_json
 from storage import save_observations
 
@@ -11,6 +12,8 @@ async def main():
     print(f"Royal Caribbean collector returned {len(records)} sailings.")
     if not records:
         raise SystemExit("No Royal Caribbean Sydney/Brisbane cruises were found.")
+
+    records = await repair_missing_solo(records, "Royal Caribbean")
 
     save_observations(records, line="Royal Caribbean")
     export_json()
