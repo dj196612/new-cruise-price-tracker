@@ -6,7 +6,9 @@ const cabinLabels = {interior:"Interior",oceanview:"Oceanview",balcony:"Balcony"
 
 function selectedPorts(){ return [...document.querySelectorAll("#ports input:checked")].map(x=>x.value); }
 function cabin(){ return $("#cabin").value; }
+function isPrincess(c){ return c.line === "Princess"; }
 function packageAddon(c){
+  if(!isPrincess(c)) return 0;
   const p=$("#farePackage").value;
   if(p==="plus") return (c.plus_addon_per_night ?? 79) * (c.nights||0);
   if(p==="premier") return (c.premier_addon_per_night ?? 129) * (c.nights||0);
@@ -36,6 +38,7 @@ function soloPremium(c){
 }
 function passes(c){
   if(!selectedPorts().includes(c.departure_port)) return false;
+  if(!isPrincess(c) && $("#farePackage").value!=="standard") return false;
   if(c.nights && c.nights < (+$("#minNights").value||0)) return false;
   if(c.nights && c.nights > (+$("#maxNights").value||999)) return false;
   if($("#dateFrom").value && c.departure_date < $("#dateFrom").value) return false;
@@ -60,7 +63,12 @@ function sortRows(rows){
   });
 }
 function dateFmt(s){ return !s?"":new Date(s+"T12:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"}); }
-function packageLabel(){ return {standard:"Princess Standard",plus:"Princess Plus",premier:"Princess Premier"}[$("#farePackage").value]; }
+function packageLabel(c){
+  if(!isPrincess(c)) return c.fare_basis || "Royal Caribbean Fare";
+  return {standard:"Princess Standard",plus:"Princess Plus",premier:"Princess Premier"}[$("#farePackage").value];
+}
+function lineUrl(c){ return c.url || (isPrincess(c)?"https://www.princess.com":"https://www.royalcaribbean.com/aus/en/cruises"); }
+function lineLinkLabel(c){ return isPrincess(c)?"View on Princess":"View on Royal Caribbean"; }
 function card(c){
   const p=priceFor(c), ppn=perNight(c), total=currentTotal(c), cur=c.currency||"AUD", low=historicalLow(c), change=priceChange(c), solo=soloPremium(c);
   const changeText = change==null?"":`<span class="badge ${change<0?"drop":"rise"}">${change<0?"↓":"↑"} ${money(Math.abs(change),cur)} since previous check</span>`;
@@ -69,23 +77,23 @@ function card(c){
   const titleDate = c.departure_date ? ` - ${dateFmt(c.departure_date)}` : "";
   return `<article class="card">
     <div>
-      <h2>${c.name||"Princess cruise"}${titleDate}</h2>
-      <div class="meta">${c.ship||"Ship TBA"} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
+      <h2>${c.name||"Cruise"}${titleDate}</h2>
+      <div class="meta">${c.line||"Cruise line"} · ${c.ship||"Ship TBA"} · ${c.nights||"?"} nights · Depart ${c.departure_port||"?"}</div>
       <div class="route">${(c.itinerary||"").slice(0,310)}</div>
-      <div class="badges"><span class="badge">${selectedAvailable?"Available":"Selected cabin unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel()}</span>${changeText}${lowText}</div>
+      <div class="badges"><span class="badge">${selectedAvailable?"Available":"Selected cabin unavailable"}</span><span class="badge">${cur}</span><span class="badge">${cabinLabels[cabin()]}</span><span class="badge">${packageLabel(c)}</span>${changeText}${lowText}</div>
     </div>
     <div class="pricing">
       <div class="price">${p==null?"Unavailable":`${money(p,cur)} pp`}</div>
       <div class="pernight">${ppn==null?"":`${money(ppn,cur)} pp / night`}</div>
       <div class="secondary">
         ${$("#passengers").value==="2" && total!=null ? `2-person total: <b>${money(total,cur)}</b><br>` : ""}
-        Standard ${cabinLabels[cabin()]}: <b>${money(basePriceFor(c),cur)}</b><br>
-        ${$("#farePackage").value!=="standard"&&p!=null?`Package add-on: <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
+        Base ${cabinLabels[cabin()]}: <b>${money(basePriceFor(c),cur)}</b><br>
+        ${isPrincess(c)&&$("#farePackage").value!=="standard"&&p!=null?`Package add-on: <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
         Solo premium: <b>${pct(solo)}</b><br>
         Historical low: <b>${money(low,cur)}</b>
       </div>
     </div>
-    <div class="actions"><a class="book" href="${c.url||"https://www.princess.com"}" target="_blank" rel="noopener">View on Princess</a><button class="history" onclick="showHistory('${c.cruise_id.replaceAll("'","")}')">Price history</button></div>
+    <div class="actions"><a class="book" href="${lineUrl(c)}" target="_blank" rel="noopener">${lineLinkLabel(c)}</a><button class="history" onclick="showHistory('${c.cruise_id.replaceAll("'","")}')">Price history</button></div>
   </article>`;
 }
 function render(){
@@ -97,8 +105,8 @@ function render(){
 }
 window.showHistory=function(id){
   const c=cruises.find(x=>x.cruise_id===id), cur=c.currency||"AUD", h=(c.history||[]).slice().reverse();
-  $("#historyTitle").textContent=`Price history — ${c.name||"Princess cruise"} — ${cabinLabels[cabin()]} — ${packageLabel()}`;
-  $("#historyBody").innerHTML=h.length?`<table class="history-table"><thead><tr><th>Checked</th><th>Standard base</th><th>Selected fare</th></tr></thead><tbody>${h.map(x=>{const base=historyBase(x), selected=base==null?null:base+packageAddon(c);return `<tr><td>${new Date(x.checked_at).toLocaleString("en-AU")}</td><td>${money(base,x.currency||cur)}</td><td>${money(selected,x.currency||cur)}</td></tr>`}).join("")}</tbody></table>`:"No historical observations yet.";
+  $("#historyTitle").textContent=`Price history — ${c.name||"Cruise"} — ${cabinLabels[cabin()]} — ${packageLabel(c)}`;
+  $("#historyBody").innerHTML=h.length?`<table class="history-table"><thead><tr><th>Checked</th><th>Base fare</th><th>Selected fare</th></tr></thead><tbody>${h.map(x=>{const base=historyBase(x), selected=base==null?null:base+packageAddon(c);return `<tr><td>${new Date(x.checked_at).toLocaleString("en-AU")}</td><td>${money(base,x.currency||cur)}</td><td>${money(selected,x.currency||cur)}</td></tr>`}).join("")}</tbody></table>`:"No historical observations yet.";
   $("#historyDialog").showModal();
 }
 function reset(){
