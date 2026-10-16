@@ -34,12 +34,18 @@ from playwright.async_api import async_playwright
 
 LINES = {
     "Royal Caribbean": {
-        "search_url": "https://www.royalcaribbean.com/aus/en/cruises",
+        "search_url": "https://www.royalcaribbean.com/aus/en/cruises?country=AUS&currency=AUD&search=adults%3A1%7Cchildren%3A0&sort=by%3ARECOMMENDED",
         "host": "royalcaribbean.com",
+        "graph_url": "https://www.royalcaribbean.com/graph",
+        "brand": "R",
+        "referer": "https://www.royalcaribbean.com/aus/en/cruises",
     },
     "Celebrity Cruises": {
-        "search_url": "https://www.celebritycruises.com/au/cruises",
+        "search_url": "https://www.celebritycruises.com/au/cruises?country=AUS&currency=AUD&search=adults%3A1%7Cchildren%3A0%7CdeparturePort%3ASYD&sort=by%3ARECOMMENDED",
         "host": "celebritycruises.com",
+        "graph_url": "https://www.celebritycruises.com/graph",
+        "brand": "C",
+        "referer": "https://www.celebritycruises.com/au/cruises",
     },
 }
 
@@ -189,8 +195,14 @@ async def _capture(context, line: str) -> tuple[str, str, dict, dict] | None:
     captured: dict[str, Any] = {}
     seen: list[str] = []
 
+    other: list[str] = []
+
     async def on_response(resp):
-        if captured or cfg["host"] not in resp.url or "graph" not in resp.url.lower():
+        if captured:
+            return
+        if "graph" not in resp.url.lower():
+            if resp.request.resource_type in ("xhr", "fetch") and len(other) < 40:
+                other.append(f"{resp.request.method} {resp.status} {resp.url[:110]}")
             return
         req = resp.request
         op = ""
@@ -264,6 +276,8 @@ async def _capture(context, line: str) -> tuple[str, str, dict, dict] | None:
         print(f"{line} solo graph: no cruiseSearch results seen. page status={status} title={title!r}; graph calls={len(seen)}")
         for item in seen[:8]:
             print(f"{line} solo graph call: {item}")
+        for item in [o for o in other if "api" in o.lower() or "search" in o.lower()][:8]:
+            print(f"{line} solo graph other xhr: {item}")
         return None
     variables = captured["payload"].get("variables") or {}
     print(
@@ -275,20 +289,20 @@ async def _capture(context, line: str) -> tuple[str, str, dict, dict] | None:
     return captured["method"], captured["url"], captured["headers"], captured["payload"]
 
 
-async def _send(context, method: str, url: str, headers: dict, payload: dict):
+async def _send(requester, method: str, url: str, headers: dict, payload: dict):
     if method == "GET":
         params = {k: (json.dumps(v, separators=(",", ":")) if isinstance(v, (dict, list)) else v) for k, v in payload.items()}
-        return await context.request.get(f"{url}?{urlencode(params)}", headers=headers, timeout=45000)
-    return await context.request.post(url, headers=headers, data=json.dumps(payload), timeout=45000)
+        return await requester.get(f"{url}?{urlencode(params)}", headers=headers, timeout=45000)
+    return await requester.post(url, headers=headers, data=json.dumps(payload), timeout=45000)
 
 
-async def _run_query(context, method: str, url: str, headers: dict, payload: dict, line: str, label: str):
+async def _run_query(requester, method: str, url: str, headers: dict, payload: dict, line: str, label: str):
     prices: dict[tuple[str, str], dict[str, float]] = {}
     skip, total = 0, None
     while total is None or skip < total:
-        response = await _send(context, method, url, headers, _with_page(payload, skip))
+        response = await _send(requester, method, url, headers, _with_page(payload, skip))
         if response.status != 200:
-            print(f"{line} solo graph [{label}]: HTTP {response.status} at skip={skip}: {(await response.text())[:300]}")
+            print(f"{line} solo graph [{label}]: HTTP {response.status} at skip={skip}: {' '.join((await response.text()).split())[:600]}")
             return None
         body = await response.json()
         if body.get("errors"):
@@ -305,12 +319,110 @@ async def _run_query(context, method: str, url: str, headers: dict, payload: dic
     return prices
 
 
+# ------------------------------------------------------------ direct query
+# The trackers already call this endpoint successfully for the catalogue, so
+# ask it for per-cabin prices directly (AU market, 1 vs 2 adults) before
+# falling back to capturing the page's own request. Field selections are tried
+# in order; GraphQL errors name the right fields and are logged.
+_QUERY_HEAD = """query cruiseSearch_Cruises($filters: String, $qualifiers: String, $sort: CruiseSearchSort, $pagination: CruiseSearchPagination) {
+  cruiseSearch(filters: $filters, qualifiers: $qualifiers, sort: $sort, pagination: $pagination) {
+    results { total cruises { id masterSailing { itinerary { code } } sailings { id sailDate itinerary { code } stateroomClassPricing { %s } } } }
+  }
+}"""
+PRICING_SELECTIONS = (
+    "price { value } stateroomClass { id }",
+    "price { value } stateroomClass { content { code } }",
+    "price { value currency { code } } stateroomClass { id content { code } }",
+)
+
+
+def _direct_headers(line: str) -> dict:
+    cfg = LINES[line]
+    return {
+        "accept": "*/*",
+        "accept-language": "en-AU,en;q=0.9",
+        "apollographql-client-name": "cruise-search-widget",
+        "app-name": "graph",
+        "brand": cfg["brand"],
+        "content-type": "application/json",
+        "country": "AUS",
+        "countryalpha2code": "AU",
+        "currency": "AUD",
+        "language": "en",
+        "office": "SYD",
+        "referer": cfg["referer"],
+        "user-agent": UA,
+    }
+
+
+def _direct_payload(selection: str) -> dict:
+    return {
+        "operationName": "cruiseSearch_Cruises",
+        "variables": {
+            "filters": "{}",
+            "qualifiers": "adults:2|children:0",
+            "sort": {"by": "RECOMMENDED"},
+            "pagination": {"count": PAGE_SIZE, "skip": 0},
+        },
+        "query": _QUERY_HEAD % selection,
+    }
+
+
+async def _direct(p, line: str):
+    request = await p.request.new_context()
+    try:
+        url = LINES[line]["graph_url"]
+        headers = _direct_headers(line)
+        for i, selection in enumerate(PRICING_SELECTIONS, 1):
+            template = _direct_payload(selection)
+            solo_payload, _ = _set_adults(template, 1)
+            solo = await _run_query(request, "POST", url, headers, solo_payload, line, f"direct v{i} 1 adult")
+            if solo is None:
+                continue  # errors were logged; try the next field selection
+            double_payload, _ = _set_adults(template, 2)
+            double = await _run_query(request, "POST", url, headers, double_payload, line, f"direct v{i} 2 adults")
+            return solo, double
+        return None, None
+    finally:
+        await request.dispose()
+
+
+def _verified(line: str, solo, double, label: str) -> dict:
+    if not solo or not double:
+        return {}
+    # Solo must cost clearly more than the 2-adult per-person price, or the
+    # adult qualifier did not take effect.
+    higher = same = 0
+    for key, cabins in solo.items():
+        d = (double.get(key) or {}).get("interior")
+        s_ = cabins.get("interior")
+        if s_ is None or d is None:
+            continue
+        if s_ > d * 1.05:
+            higher += 1
+        elif abs(s_ - d) <= 1:
+            same += 1
+    compared = higher + same
+    print(f"{line} solo graph check [{label}]: {higher}/{compared} solo > 2-adult pp, {same} identical")
+    if compared < 3 or higher < compared * 0.8:
+        print(f"{line} solo graph REJECTED [{label}]: 1-adult prices not distinct from 2-adult prices")
+        return {}
+    return solo
+
+
 # --------------------------------------------------------------------- main
 
 async def fetch_solo_prices(line: str, headless: bool = True) -> dict[tuple[str, str], dict[str, float]]:
     """Return {(PACKAGECODE, 'YYYY-MM-DD'): {cabin: AUD solo price}}; empty on any failure."""
     try:
         async with async_playwright() as p:
+            # 1) Direct query to the graph endpoint.
+            solo, double = await _direct(p, line)
+            result = _verified(line, solo, double, "direct")
+            if result:
+                return result
+
+            # 2) Fallback: capture the AU search page's own request and replay it.
             browser = await p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
             context = await browser.new_context(
                 locale="en-AU",
@@ -323,40 +435,14 @@ async def fetch_solo_prices(line: str, headless: bool = True) -> dict[tuple[str,
                 if not captured:
                     return {}
                 method, url, headers, template = captured
-
                 solo_payload, rewrote = _set_adults(template, 1)
                 double_payload, _ = _set_adults(template, 2)
                 print(f"{line} solo graph: adult qualifier {'rewritten' if rewrote else 'added'}")
-
-                solo = await _run_query(context, method, url, headers, solo_payload, line, "1 adult")
-                double = await _run_query(context, method, url, headers, double_payload, line, "2 adults")
+                solo = await _run_query(context.request, method, url, headers, solo_payload, line, "page 1 adult")
+                double = await _run_query(context.request, method, url, headers, double_payload, line, "page 2 adults")
             finally:
                 await browser.close()
+            return _verified(line, solo, double, "page capture")
     except Exception as exc:
         print(f"{line} solo graph failed: {type(exc).__name__}: {exc}")
         return {}
-
-    if not solo or not double:
-        return {}
-
-    # Verify the qualifier really changed occupancy: solo should cost more than
-    # the 2-adult per-person price on (nearly) every sailing.
-    higher = same = 0
-    for key, cabins in solo.items():
-        d = (double.get(key) or {}).get("interior")
-        s = cabins.get("interior")
-        if s is None or d is None:
-            continue
-        if s > d * 1.05:
-            higher += 1
-        elif abs(s - d) <= 1:
-            same += 1
-    compared = higher + same
-    print(f"{line} solo graph check: {higher}/{compared} solo > 2-adult pp, {same} identical")
-    if compared < 3 or higher < compared * 0.8:
-        print(
-            f"{line} solo graph REJECTED: 1-adult prices are not distinct from 2-adult prices, "
-            "so the adult qualifier did not take effect. Solo fares left unchanged."
-        )
-        return {}
-    return solo
