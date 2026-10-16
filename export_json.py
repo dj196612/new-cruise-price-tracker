@@ -27,6 +27,14 @@ def main():
             r["fare_basis"] = "Celebrity Fare"
             r["plus_addon_per_night"] = None
             r["premier_addon_per_night"] = None
+        elif line == "Norwegian Cruise Line":
+            r["fare_basis"] = "NCL Fare"
+            r["plus_addon_per_night"] = None
+            r["premier_addon_per_night"] = None
+        elif line == "Carnival Cruise Line":
+            r["fare_basis"] = "Carnival Fare (best of Standard / 55+)"
+            r["plus_addon_per_night"] = None
+            r["premier_addon_per_night"] = None
         else:
             r["fare_basis"] = "Royal Caribbean Fare"
             r["plus_addon_per_night"] = None
