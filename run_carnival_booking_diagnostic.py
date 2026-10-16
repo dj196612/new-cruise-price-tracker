@@ -60,6 +60,24 @@ async def _find_sailing(request):
 
 
 async def _dismiss_cookie_overlay(page):
+    try:
+        removed = await page.evaluate("""
+        () => {
+          let removed = 0;
+          for (const selector of ['#onetrust-consent-sdk', '.onetrust-pc-dark-filter']) {
+            document.querySelectorAll(selector).forEach(el => { el.remove(); removed += 1; });
+          }
+          document.documentElement.style.overflow = 'auto';
+          document.body.style.overflow = 'auto';
+          return removed;
+        }
+        """)
+        if removed:
+            print(f"CARNIVAL_COOKIE_OVERLAY_REMOVED count={removed}")
+            return True
+    except Exception as exc:
+        print(f"CARNIVAL_COOKIE_REMOVE_ERROR {type(exc).__name__}: {exc}")
+
     for selector in (
         "#onetrust-accept-btn-handler",
         "button:has-text('Accept All Cookies')",
@@ -68,29 +86,19 @@ async def _dismiss_cookie_overlay(page):
     ):
         try:
             btn = page.locator(selector).first
-            if await btn.is_visible(timeout=1200):
+            if await btn.is_visible(timeout=500):
                 await btn.click(force=True)
                 print(f"CARNIVAL_COOKIE_DISMISSED selector={selector}")
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(500)
                 return True
         except Exception:
             pass
-
-    try:
-        visible = await page.locator("#onetrust-consent-sdk").is_visible(timeout=800)
-        if visible:
-            await page.locator("#onetrust-consent-sdk").evaluate("el => el.remove()")
-            print("CARNIVAL_COOKIE_OVERLAY_REMOVED")
-            return True
-    except Exception:
-        pass
 
     print("CARNIVAL_COOKIE_OVERLAY_NOT_PRESENT")
     return False
 
 
 async def _click_continue(page, stage: str):
-    await _dismiss_cookie_overlay(page)
     buttons = page.locator("button")
     for i in range(await buttons.count()):
         try:
@@ -103,7 +111,10 @@ async def _click_continue(page, stage: str):
             enabled = await btn.is_enabled()
             print(f"CARNIVAL_BOOKING_BUTTON stage={stage} text={text} enabled={enabled}")
             if enabled:
-                await btn.click()
+                await _dismiss_cookie_overlay(page)
+                await page.wait_for_timeout(250)
+                await _dismiss_cookie_overlay(page)
+                await btn.click(force=True)
                 print(f"CARNIVAL_BOOKING_CLICK stage={stage} text={text}")
                 await page.wait_for_timeout(7000)
                 return True
@@ -195,7 +206,6 @@ async def _probe_booking(browser, sailing_url: str):
     print(f"CARNIVAL_BOOKING_STATUS {response.status if response else 'none'} final={page.url}")
     await page.wait_for_timeout(7000)
 
-    await _dismiss_cookie_overlay(page)
     await _click_continue(page, "rooms-guests")
     senior_ok = await _apply_senior(page)
     print(f"CARNIVAL_BOOKING_55_PLUS_RESULT {senior_ok}")
