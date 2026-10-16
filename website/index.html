@@ -38,6 +38,26 @@
     </div>
 
     <div class="filter">
+      <label>Cabin</label>
+      <select id="cabin">
+        <option value="interior" selected>Interior</option>
+        <option value="oceanview">Oceanview</option>
+        <option value="balcony">Balcony</option>
+        <option value="mini_suite">Mini-Suite</option>
+        <option value="suite">Suite</option>
+      </select>
+    </div>
+
+    <div class="filter">
+      <label>Fare package</label>
+      <select id="farePackage">
+        <option value="standard" selected>Princess Standard</option>
+        <option value="plus">Princess Plus (+$79/night)</option>
+        <option value="premier">Princess Premier (+$129/night)</option>
+      </select>
+    </div>
+
+    <div class="filter">
       <label>Min nights</label>
       <input id="minNights" type="number" min="1" value="1">
     </div>
@@ -56,7 +76,7 @@
     </div>
 
     <div class="filter">
-      <label>Maximum price</label>
+      <label>Maximum price pp</label>
       <input id="maxPrice" type="number" min="0" step="50" placeholder="Any">
     </div>
 
@@ -69,7 +89,7 @@
       <label>Sort by</label>
       <select id="sort">
         <option value="dayprice">Best price per night</option>
-        <option value="price">Lowest total / fare</option>
+        <option value="price">Lowest fare</option>
         <option value="date">Departure date</option>
         <option value="drop">Largest price drop</option>
         <option value="lengthDesc">Longest cruise</option>
