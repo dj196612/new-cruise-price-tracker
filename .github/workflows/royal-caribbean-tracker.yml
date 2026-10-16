@@ -36,7 +36,15 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run Royal Caribbean tracker
-        run: python run_royal_caribbean.py
+        shell: bash
+        run: |
+          set -o pipefail
+          enc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}'; }
+          if ! python run_royal_caribbean.py 2>&1 | tee run.log; then
+            echo "::error title=Royal Caribbean tracker failed (last 40 lines)::$(tail -n 40 run.log | enc)"
+            exit 1
+          fi
+          echo "::notice title=Royal Caribbean solo summary::$(grep -iE 'solo (result|graph|repair|interior pricing)|solo Interior pricing|production result' run.log | tail -n 15 | enc)"
 
       - name: Commit updated cruise data
         run: |
