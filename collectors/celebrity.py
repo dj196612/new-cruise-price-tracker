@@ -219,7 +219,18 @@ async def _price(request, sailing: dict, adults: int) -> dict | None:
         ),
         None,
     )
-    return _room_summary(exact) if exact else None
+    summary = _room_summary(exact) if exact else None
+    if adults == 1 and not summary:
+        if not body.get("sailings"):
+            reason = "HTTP 200 but no sailings in response"
+        elif not exact:
+            ids = [s.get("id") for s in (body.get("sailings") or [])][:5]
+            reason = f"no sailing matched {target_id} (got {ids})"
+        else:
+            rooms = exact.get("rooms") or []
+            reason = f"sailing matched but {len(rooms)} rooms had no 1-adult pricing"
+        print(f"Celebrity solo empty: package={package} date={sail_date}: {reason}")
+    return summary or None
 
 
 def _au_url(cruise: dict, sailing: dict) -> str:

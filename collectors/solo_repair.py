@@ -5,6 +5,8 @@ import re
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
+from .rcg_solo_graph import fetch_solo_prices
+
 
 CONFIG = {
     "Royal Caribbean": {
@@ -113,37 +115,79 @@ async def _fetch_solo(request, *, room_url: str, referer: str, package: str, sai
     return None
 
 
+SOLO_CABINS = ("interior", "oceanview", "balcony", "suite")
+
+
+def _has_solo_gap(record: dict) -> bool:
+    if record.get("two_guest_interior_pp") is None and record.get("two_guest_balcony_pp") is None:
+        return False  # nothing bookable for 2 either; not a solo problem
+    return any(record.get(f"one_guest_{c}") is None for c in SOLO_CABINS)
+
+
+def _apply(record: dict, prices: dict[str, float | None]) -> int:
+    """Fill only the solo cabins that are still missing. Returns cells filled."""
+    filled = 0
+    for cabin in SOLO_CABINS:
+        key = f"one_guest_{cabin}"
+        if record.get(key) is None and prices.get(cabin) is not None:
+            record[key] = prices[cabin]
+            filled += 1
+    if record.get("one_guest_interior") is not None:
+        record["one_guest_price"] = record["one_guest_interior"]
+        record["available"] = True
+    return filled
+
+
+def _key(record: dict, prefix: str) -> tuple[str, str] | None:
+    parts = (record.get("cruise_id") or "").split(":")
+    if len(parts) < 3 or parts[0] != prefix:
+        return None
+    return parts[1].upper(), (record.get("departure_date") or parts[2])[:10]
+
+
 async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
     config = CONFIG[line]
-    missing = [r for r in records if r.get("one_guest_interior") is None]
-    if not missing:
-        print(f"{line} solo repair: no missing Interior prices")
+    gaps = [r for r in records if _has_solo_gap(r)]
+    before = sum(1 for r in records if r.get("one_guest_interior") is not None)
+    if not gaps:
+        print(f"{line} solo repair: no missing solo prices")
         return records
 
-    fixed = 0
-    async with async_playwright() as p:
-        request = await p.request.new_context(extra_http_headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
-        })
-        for record in missing:
-            parts = (record.get("cruise_id") or "").split(":")
-            if len(parts) < 3 or parts[0] != config["prefix"]:
-                continue
-            package = parts[1]
-            sail_date = record.get("departure_date") or parts[2]
-            prices = await _fetch_solo(request, room_url=config["room_url"], referer=config["referer"], package=package, sail_date=sail_date)
-            if not prices or prices.get("interior") is None:
-                continue
-            record["one_guest_price"] = prices["interior"]
-            record["one_guest_interior"] = prices["interior"]
-            record["one_guest_oceanview"] = prices.get("oceanview")
-            record["one_guest_balcony"] = prices.get("balcony")
-            record["one_guest_suite"] = prices.get("suite")
-            record["available"] = True
-            fixed += 1
-            print(f"{line} solo repair fixed {sail_date} {record.get('name')} Interior=AUD {prices['interior']:.0f}")
-            await asyncio.sleep(0.1)
-        await request.dispose()
+    # 1) Primary source: the site's own AU cruise-search GraphQL at 1 adult.
+    graph = await fetch_solo_prices(line)
+    graph_rows = graph_cells = 0
+    for record in gaps:
+        key = _key(record, config["prefix"])
+        if key and key in graph:
+            cells = _apply(record, graph[key])
+            if cells:
+                graph_rows += 1
+                graph_cells += cells
+    print(f"{line} solo repair (search graph): filled {graph_cells} cabin prices on {graph_rows}/{len(gaps)} sailings")
 
-    print(f"{line} solo repair result: {fixed}/{len(missing)} missing solo Interior prices repaired")
+    # 2) Fallback: retry the itinerary API for anything still missing Interior
+    #    (only helps with transient errors/timeouts from the first pass).
+    missing = [r for r in records if _has_solo_gap(r) and r.get("one_guest_interior") is None]
+    fixed = 0
+    if missing:
+        async with async_playwright() as p:
+            request = await p.request.new_context(extra_http_headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
+            })
+            for record in missing:
+                key = _key(record, config["prefix"])
+                if not key:
+                    continue
+                prices = await _fetch_solo(request, room_url=config["room_url"], referer=config["referer"], package=key[0], sail_date=key[1])
+                if prices and _apply(record, prices):
+                    fixed += 1
+                await asyncio.sleep(0.1)
+            await request.dispose()
+        print(f"{line} solo repair (itinerary retry): {fixed}/{len(missing)} more sailings priced")
+
+    after = sum(1 for r in records if r.get("one_guest_interior") is not None)
+    still = [r for r in records if _has_solo_gap(r) and r.get("one_guest_interior") is None]
+    print(f"{line} solo result: Interior solo on {after}/{len(records)} sailings (was {before}); {len(still)} still missing")
+    for r in still[:15]:
+        print(f"  still missing solo: {r.get('departure_date')} {r.get('ship')} {r.get('cruise_id')}")
     return records
