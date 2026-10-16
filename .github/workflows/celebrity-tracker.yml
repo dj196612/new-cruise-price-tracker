@@ -45,6 +45,7 @@ jobs:
             exit 1
           fi
           echo "::notice title=Celebrity solo summary::$(grep -iE 'solo (result|graph|repair|interior pricing)|solo Interior pricing|production result' run.log | tail -n 15 | enc)"
+          if grep -q "solo empty" run.log; then echo "::notice title=Celebrity empty solo reasons ($(grep -c "solo empty" run.log) sailings)::$(grep "solo empty" run.log | head -n 8 | enc)"; fi
 
       - name: Commit updated cruise data
         run: |
@@ -52,4 +53,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add data/cruises.db data/latest.json
           git diff --cached --quiet || git commit -m "Update Celebrity cruise prices"
+          git pull --rebase origin main
           git push
