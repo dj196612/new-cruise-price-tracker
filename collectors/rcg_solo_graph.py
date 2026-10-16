@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -336,52 +337,90 @@ PRICING_SELECTIONS = (
 )
 
 
-def _direct_headers(line: str) -> dict:
+def _direct_headers(line: str, market: str = "AU") -> dict:
     cfg = LINES[line]
-    return {
+    headers = {
         "accept": "*/*",
-        "accept-language": "en-AU,en;q=0.9",
         "apollographql-client-name": "cruise-search-widget",
         "app-name": "graph",
         "brand": cfg["brand"],
         "content-type": "application/json",
-        "country": "AUS",
-        "countryalpha2code": "AU",
-        "currency": "AUD",
         "language": "en",
-        "office": "SYD",
         "referer": cfg["referer"],
         "user-agent": UA,
+        "x-session-id": str(uuid.uuid4()),
     }
+    if market == "AU":
+        headers.update({"accept-language": "en-AU,en;q=0.9", "country": "AUS", "countryalpha2code": "AU", "currency": "AUD", "office": "SYD"})
+    elif market == "AU-no-office":
+        headers.update({"accept-language": "en-AU,en;q=0.9", "country": "AUS", "countryalpha2code": "AU", "currency": "AUD"})
+    else:  # US: same context the working catalogue call uses (diagnostic baseline only)
+        headers.update({"accept-language": "en-US,en;q=0.9", "country": "USA", "countryalpha2code": "US", "currency": "USD", "office": "MIA"})
+    return headers
 
 
-def _direct_payload(selection: str) -> dict:
-    return {
-        "operationName": "cruiseSearch_Cruises",
-        "variables": {
-            "filters": "{}",
-            "qualifiers": "adults:2|children:0",
-            "sort": {"by": "RECOMMENDED"},
-            "pagination": {"count": PAGE_SIZE, "skip": 0},
-        },
-        "query": _QUERY_HEAD % selection,
-    }
+# Where the guest count goes. The site's own search URL is
+# search=adults:1|children:0|departurePort:SYD, so try it as filters first.
+GUEST_PLACEMENTS = {
+    "filters":            lambda n: {"filters": f"adults:{n}|children:0"},
+    "qualifiers":         lambda n: {"filters": "{}", "qualifiers": f"adults:{n}|children:0"},
+    "qualifiers-only":    lambda n: {"qualifiers": f"adults:{n}|children:0"},
+    "filters+qualifiers": lambda n: {"filters": f"adults:{n}|children:0", "qualifiers": f"adults:{n}|children:0"},
+}
+ATTEMPTS = (
+    ("AU", "filters"), ("AU", "qualifiers"), ("AU", "qualifiers-only"), ("AU", "filters+qualifiers"),
+    ("AU-no-office", "filters"), ("AU-no-office", "qualifiers"),
+)
+
+
+def _direct_payload(selection: str, placement: str, adults: int) -> dict:
+    variables = {"sort": {"by": "RECOMMENDED"}, "pagination": {"count": PAGE_SIZE, "skip": 0}}
+    variables.update(GUEST_PLACEMENTS[placement](adults))
+    return {"operationName": "cruiseSearch_Cruises", "variables": variables, "query": _QUERY_HEAD % selection}
+
+
+async def _first_page(request, url: str, headers: dict, payload: dict):
+    response = await request.post(url, headers=headers, data=json.dumps(payload), timeout=45000)
+    text = await response.text()
+    try:
+        body = json.loads(text)
+    except Exception:
+        return response.status, None, " ".join(text.split())[:200]
+    if response.status != 200 or body.get("errors"):
+        return response.status, None, " ".join(str(body.get("errors") or text).split())[:300]
+    total, count, prices = _parse(body)
+    sample = next(iter(prices.values()), None)
+    return response.status, (total, count, len(prices)), f"sample={sample}"
 
 
 async def _direct(p, line: str):
     request = await p.request.new_context()
     try:
         url = LINES[line]["graph_url"]
-        headers = _direct_headers(line)
-        for i, selection in enumerate(PRICING_SELECTIONS, 1):
-            template = _direct_payload(selection)
-            solo_payload, _ = _set_adults(template, 1)
-            solo = await _run_query(request, "POST", url, headers, solo_payload, line, f"direct v{i} 1 adult")
-            if solo is None:
-                continue  # errors were logged; try the next field selection
-            double_payload, _ = _set_adults(template, 2)
-            double = await _run_query(request, "POST", url, headers, double_payload, line, f"direct v{i} 2 adults")
-            return solo, double
+        # Baseline: does this exact query return anything in the context the catalogue call uses?
+        status, stats, note = await _first_page(request, url, _direct_headers(line, "US"), _direct_payload(PRICING_SELECTIONS[0], "qualifiers-only", 2))
+        print(f"{line} solo graph probe [US baseline]: HTTP {status} total/groups/priced={stats} {note}")
+
+        for selection_index, selection in enumerate(PRICING_SELECTIONS, 1):
+            field_error = False
+            for market, placement in ATTEMPTS:
+                headers = _direct_headers(line, market)
+                status, stats, note = await _first_page(request, url, headers, _direct_payload(selection, placement, 1))
+                print(f"{line} solo graph probe [v{selection_index} {market} {placement}]: HTTP {status} total/groups/priced={stats} {note}")
+                if stats is None:
+                    if "Cannot query field" in note or "Did you mean" in note:
+                        field_error = True
+                        break  # wrong field names; try the next selection
+                    continue
+                if stats[2] == 0:
+                    continue
+                label = f"direct v{selection_index} {market} {placement}"
+                solo = await _run_query(request, "POST", url, headers, _direct_payload(selection, placement, 1), line, label + " 1 adult")
+                double = await _run_query(request, "POST", url, _direct_headers(line, market), _direct_payload(selection, placement, 2), line, label + " 2 adults")
+                if _verified(line, solo, double, label):
+                    return solo, double
+            if not field_error:
+                break  # fields were fine; other selections won't change the result
         return None, None
     finally:
         await request.dispose()
