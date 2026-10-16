@@ -271,7 +271,8 @@ def _solo_cabin_prices(cruises: list[dict], fare_type: str = SOLO_FARE_TYPE) -> 
                 guests = category.get("guests") or []
                 if not guests:
                     continue
-                value = guests[0].get("fare")
+                first = next((g for g in guests if str(g.get("id")) == "1"), guests[0])
+                value = first.get("fare")
                 try:
                     value = float(value)
                 except (TypeError, ValueError):
@@ -326,11 +327,11 @@ async def _capture_pricing_session(context, seed_url: str):
     return headers, captured["payload"]
 
 
-def _solo_payload(template_payload: dict) -> dict:
+def _solo_payload(template_payload: dict, guests: int = 1, fare_flag: str | None = None) -> dict:
     payload = copy.deepcopy(template_payload)
     booking = payload.setdefault("booking", {})
     booking["currencyCode"] = "AUD"
-    booking["guests"] = [{"country": "AU", "homeCity": "SYD"}]
+    booking["guests"] = [{"country": "AU", "homeCity": "SYD"} for _ in range(guests)]
     booking.setdefault("bookingAgency", {}).update({
         "id": "DIRECTAU",
         "bookingCompany": "PA",
@@ -339,7 +340,7 @@ def _solo_payload(template_payload: dict) -> dict:
     })
     payload.setdefault("filters", {})["cruises"] = []
     flags = payload.setdefault("retrieveFlags", {})
-    flags["fareType"] = SOLO_FARE_TYPE
+    flags["fareType"] = fare_flag or SOLO_FARE_TYPE
     flags["additionalGuestFare"] = True
     return payload
 
@@ -358,6 +359,7 @@ class _PricingSession:
         self.template = template
         self.generation = 0
         self.refreshes = 0
+        self.two_guest_ok = False
         self._lock = asyncio.Lock()
 
     async def refresh(self, seen_generation: int) -> bool:
@@ -377,7 +379,7 @@ class _PricingSession:
             return True
 
 
-async def _post_pricing(session: "_PricingSession", payload: dict, path_code: str) -> dict | None:
+async def _post_pricing(session: "_PricingSession", payload: dict, path_code: str) -> tuple[int, dict | None]:
     for attempt in (1, 2):
         generation = session.generation
         response = await session.context.request.post(
@@ -389,43 +391,74 @@ async def _post_pricing(session: "_PricingSession", payload: dict, path_code: st
         if response.status == 403 and attempt == 1 and await session.refresh(generation):
             continue
         if response.status != 200:
-            print(f"Solo API {path_code}: HTTP {response.status}")
-            return None
-        return json.loads(await response.text())
-    return None
+            return response.status, None
+        return 200, json.loads(await response.text())
+    return 403, None
+
+
+async def _fetch_fares(session: "_PricingSession", code: str, guests: int):
+    """Price one voyage for `guests` guests. Returns (prices, statuses, cruises, data, notes)."""
+    attempts = [code]
+    parent = _base_code(code)
+    if parent:
+        attempts.append(parent)
+    notes: list[str] = []
+    prices, statuses, cruises, data, seen = None, Counter(), [], None, []
+    for path_code in attempts:
+        # Some voyages return 403 when requested on the Standard flag but price
+        # normally on the Plus flag; the response carries every fare type
+        # either way and we still read the Standard (BESTFARE) fare from it.
+        for flag in (SOLO_FARE_TYPE, "BESTVALUE"):
+            status, data = await _post_pricing(session, _solo_payload(session.template, guests, flag), path_code)
+            if status == 200:
+                if flag != SOLO_FARE_TYPE:
+                    notes.append(f"requested with {flag} flag after HTTP 403")
+                break
+            notes.append(f"{path_code} {flag}: HTTP {status}")
+            if status != 403:
+                break
+        if not data:
+            continue
+        cruises, seen = _matching_cruises(data, code)
+        if not cruises:
+            continue
+        prices, statuses = _solo_cabin_prices(cruises)
+        if any(v is not None for v in prices.values()):
+            if path_code != code:
+                notes.append(f"priced via parent code {path_code}")
+            break
+    if not cruises:
+        notes.append(f"no matching cruise in response; ids returned={seen[:12]}")
+    return prices, statuses, cruises, data, notes
 
 
 async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: asyncio.Semaphore):
     code = _voyage_code(record)
-    if not code or record.get("two_guest_interior_pp") is None:
+    if not code:
         return
 
     async with semaphore:
-        payload = _solo_payload(session.template)
         try:
-            # Segment / combined voyages (A714B, 1735A ...) may only be priced
-            # under the parent code, so retry with it and pick the exact cruise.
-            attempts = [code]
-            parent = _base_code(code)
-            if parent:
-                attempts.append(parent)
+            # 2 guests from the API when the page scrape found no 2-guest price.
+            if record.get("two_guest_interior_pp") is None and session.two_guest_ok:
+                two, _, two_cruises, two_data, notes = await _fetch_fares(session, code, 2)
+                if two and any(v is not None for v in two.values()):
+                    for cabin in base.CABINS:
+                        if record.get(f"two_guest_{cabin}_pp") is None:
+                            record[f"two_guest_{cabin}_pp"] = two.get(cabin)
+                    record["two_guest_pp_price"] = record.get("two_guest_interior_pp")
+                    if record["two_guest_pp_price"] is not None:
+                        record["two_guest_total"] = round(record["two_guest_pp_price"] * 2, 2)
+                    record["available"] = True
+                    record["currency"] = record.get("currency") or "AUD"
+                    print(f"Solo API {code}: 2-guest filled from pricing API: Interior {two.get('interior')} | Balcony {two.get('balcony')}")
+                else:
+                    print(f"Solo API {code}: no 2-guest price from pricing API either ({'; '.join(notes) or 'no bookable fare'})")
 
-            prices, statuses, cruises, seen = None, Counter(), [], []
-            for path_code in attempts:
-                data = await _post_pricing(session, payload, path_code)
-                if not data:
-                    continue
-                cruises, seen = _matching_cruises(data, code)
-                if not cruises:
-                    continue
-                prices, statuses = _solo_cabin_prices(cruises)
-                if prices.get("interior") is not None or any(v is not None for v in prices.values()):
-                    if path_code != code:
-                        print(f"Solo API {code}: priced via parent code {path_code}")
-                    break
-
+            prices, statuses, cruises, data, notes = await _fetch_fares(session, code, 1)
+            for note in notes:
+                print(f"Solo API {code}: {note}")
             if not cruises:
-                print(f"Solo API {code}: no matching cruise in response; ids returned={seen[:12]}")
                 return
             if not prices or not any(v is not None for v in prices.values()):
                 fare_types = sorted({(f.get("fareType") or "?") for c in cruises for f in ((c.get("pricing") or {}).get("fares") or [])})
@@ -435,8 +468,10 @@ async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: a
             for cabin in base.CABINS:
                 record[f"one_guest_{cabin}"] = prices.get(cabin)
             record["one_guest_price"] = prices.get("interior")
+            if prices.get("interior") is None:
+                print(f"Solo API {code}: no Interior solo fare (other cabins priced)")
             if not record.get("departure_date"):
-                api_date = _sail_date(cruises) or _find_voyage_date(data, code)
+                api_date = _sail_date(cruises) or (_find_voyage_date(data, code) if data else None)
                 if api_date:
                     record["departure_date"] = api_date
                     record["cruise_id"] = base.make_id(code, api_date)
@@ -449,12 +484,34 @@ async def _fetch_one_solo(session: "_PricingSession", record: dict, semaphore: a
             print(f"Solo API {code} failed: {exc}")
 
 
+async def _calibrate_two_guest(session: "_PricingSession", seeded: list[dict]) -> None:
+    """Only fill missing 2-guest prices from the API if it matches the page's Standard price."""
+    ratios = []
+    for record in seeded[:6]:
+        code = _voyage_code(record)
+        try:
+            two, *_ = await _fetch_fares(session, code, 2)
+        except Exception:
+            continue
+        api, page = (two or {}).get("interior"), record.get("two_guest_interior_pp")
+        if api and page:
+            ratios.append(api / page)
+    ratios.sort()
+    median = ratios[len(ratios) // 2] if ratios else None
+    session.two_guest_ok = bool(median and len(ratios) >= 3 and 0.97 <= median <= 1.03)
+    print(
+        f"Princess 2-guest API calibration: {len(ratios)} voyages, median API/page ratio "
+        f"{median if median is None else round(median, 3)} -> {'using API to fill missing 2-guest prices' if session.two_guest_ok else 'NOT filling 2-guest prices'}"
+    )
+
+
 async def _populate_solo_prices(records: list[dict], headless: bool):
-    priced = [r for r in records if r.get("two_guest_interior_pp") is not None and _voyage_code(r)]
-    if not priced:
+    targets = [r for r in records if _voyage_code(r)]
+    seeded = [r for r in targets if r.get("two_guest_interior_pp") is not None]
+    if not seeded:
         return
 
-    seed_url = priced[0].get("url")
+    seed_url = seeded[0].get("url")
     if not seed_url:
         return
 
@@ -477,10 +534,11 @@ async def _populate_solo_prices(records: list[dict], headless: bool):
         await context.route(base.LOCALE_URL, force_locale)
         headers, template_payload = await _capture_pricing_session(context, seed_url)
         session = _PricingSession(context, seed_url, headers, template_payload)
+        await _calibrate_two_guest(session, seeded)
         semaphore = asyncio.Semaphore(4)
         await asyncio.gather(*(
             _fetch_one_solo(session, record, semaphore)
-            for record in priced
+            for record in targets
         ))
         await browser.close()
 

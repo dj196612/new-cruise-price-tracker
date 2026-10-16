@@ -164,18 +164,47 @@ def _currency_matches(records: list[dict], double: dict, prefix: str, line: str)
     return ok
 
 
+def _fill_two_guest(record: dict, prices: dict) -> int:
+    filled = 0
+    for cabin in SOLO_CABINS:
+        key = f"two_guest_{cabin}_pp"
+        if record.get(key) is None and prices.get(cabin) is not None:
+            record[key] = prices[cabin]
+            filled += 1
+    if record.get("two_guest_pp_price") is None and record.get("two_guest_interior_pp") is not None:
+        record["two_guest_pp_price"] = record["two_guest_interior_pp"]
+        record["two_guest_total"] = round(record["two_guest_interior_pp"] * 2, 2)
+        record["available"] = True
+    return filled
+
+
 async def repair_missing_solo(records: list[dict], line: str) -> list[dict]:
     config = CONFIG[line]
-    gaps = [r for r in records if _has_solo_gap(r)]
     before = sum(1 for r in records if r.get("one_guest_interior") is not None)
-    if not gaps:
-        print(f"{line} solo repair: no missing solo prices")
+    two_missing = [r for r in records if any(r.get(f"two_guest_{c}_pp") is None for c in SOLO_CABINS)]
+    if not [r for r in records if _has_solo_gap(r)] and not two_missing:
+        print(f"{line} solo repair: no missing solo or 2-guest prices")
         return records
 
-    # 1) Primary source: the site's own AU cruise-search GraphQL at 1 adult.
+    # 1) Primary source: the site's own AU cruise-search GraphQL at 1 and 2 adults.
     graph, graph_double = await fetch_solo_prices(line)
     if graph and not _currency_matches(records, graph_double, config["prefix"], line):
-        graph = {}
+        graph, graph_double = {}, {}
+
+    # Fill 2-adult gaps first (same verified AUD source), so those sailings
+    # can then get solo prices too.
+    two_rows = two_cells = 0
+    for record in two_missing:
+        key = _key(record, config["prefix"])
+        if key and key in graph_double:
+            cells = _fill_two_guest(record, graph_double[key])
+            if cells:
+                two_rows += 1
+                two_cells += cells
+    if graph_double:
+        print(f"{line} solo repair (search graph): filled {two_cells} 2-adult cabin prices on {two_rows}/{len(two_missing)} sailings")
+
+    gaps = [r for r in records if _has_solo_gap(r)]
     graph_rows = graph_cells = 0
     for record in gaps:
         key = _key(record, config["prefix"])
