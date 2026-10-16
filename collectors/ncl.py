@@ -19,6 +19,16 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _is_cruise_only(item: dict) -> bool:
+    title = (item.get("title") or "").strip().lower()
+    bundle_type = (item.get("bundleType") or item.get("bundle_type") or "").strip().lower()
+    if "cruisetour" in title or "cruise tour" in title:
+        return False
+    if bundle_type and bundle_type != "cruise":
+        return False
+    return True
+
+
 async def _get_json(request, url: str, *, params: dict | None = None, label: str = "request"):
     for attempt in range(1, 3):
         try:
@@ -59,12 +69,19 @@ async def _search_all(request) -> list[dict]:
         if not body:
             break
         rows = body.get("itineraries") or []
+        skipped_non_cruise = 0
         for item in rows:
             code = (item.get("code") or "").strip()
             dep = ((item.get("embarkationPort") or {}).get("code") or "").upper()
+            if not _is_cruise_only(item):
+                skipped_non_cruise += 1
+                continue
             if code and dep == "SYD":
                 found[code] = item
-        print(f"NCL search offset={offset}: {len(rows)} rows, Sydney itineraries={len(found)}")
+        print(
+            f"NCL search offset={offset}: {len(rows)} rows, "
+            f"Sydney cruise itineraries={len(found)}, non-cruise packages skipped={skipped_non_cruise}"
+        )
         if len(rows) < PAGE_SIZE:
             break
         offset += len(rows)
@@ -121,7 +138,7 @@ async def collect(headless: bool = True) -> list[dict]:
         itineraries = await _search_all(request)
         if not itineraries:
             await request.dispose()
-            raise RuntimeError("NCL collector found no Sydney itineraries")
+            raise RuntimeError("NCL collector found no Sydney cruise itineraries")
 
         records: dict[str, dict] = {}
         priced_double = 0
