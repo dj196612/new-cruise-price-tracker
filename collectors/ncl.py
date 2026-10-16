@@ -2,47 +2,63 @@ from __future__ import annotations
 
 import asyncio
 import json
-from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
-URLS = {
-    1: "https://www.ncl.com/au/en/vacations?embPorts=SYD&guests=1",
-    2: "https://www.ncl.com/au/en/vacations?embPorts=SYD&guests=2",
-}
-
-KEYWORDS = (
-    "vacation", "cruise", "itiner", "search", "price", "fare", "sailing",
-    "package", "stateroom", "cabin", "voyage"
-)
+SEARCH_API = "https://www.ncl.com/au/en/api/v2/vacations/search"
+SAMPLE_ITINERARY = "SPIRIT4SYDHBASYD"
 
 
-def _interesting(url: str, content_type: str) -> bool:
-    low = url.lower()
-    ct = (content_type or "").lower()
-    if "json" in ct or "graphql" in low or "/api/" in low:
-        return True
-    return any(k in low for k in KEYWORDS)
+async def _search_page(request, guests: int):
+    params = {
+        "embPorts": "SYD",
+        "guests": str(guests),
+        "filterConfig": "search-filters-configuration",
+        "limit": "50",
+        "offset": "0",
+    }
+    response = await request.get(SEARCH_API, params=params, timeout=30000)
+    print(f"NCL_SEARCH_STATUS guests={guests} status={response.status}")
+    try:
+        body = await response.json()
+    except Exception:
+        print(f"NCL_SEARCH_NON_JSON guests={guests}")
+        return []
+    itineraries = body.get("itineraries") or []
+    print(f"NCL_SEARCH_COUNT guests={guests} count={len(itineraries)}")
+    for item in itineraries[:5]:
+        print("NCL_SEARCH_SAMPLE " + json.dumps({
+            "guests": guests,
+            "code": item.get("code"),
+            "packageId": item.get("packageId"),
+            "title": item.get("title"),
+            "ship": (item.get("ship") or {}).get("title"),
+            "embarkation": (item.get("embarkationPort") or {}).get("code"),
+            "duration": (item.get("duration") or {}).get("days"),
+            "currency": item.get("currencyCode"),
+            "combinedPrice": item.get("combinedPrice"),
+            "basePrice": item.get("basePrice"),
+            "objectId": item.get("objectId"),
+        }, separators=(",", ":")))
+    return itineraries
 
 
-async def _probe(browser, guests: int):
+async def _probe_builder(browser, guests: int, itinerary_code: str):
     page = await browser.new_page(locale="en-AU")
     captured: list[dict] = []
 
     async def on_response(response):
         try:
-            ct = response.headers.get("content-type", "")
-            if not _interesting(response.url, ct):
+            url = response.url
+            ct = (response.headers.get("content-type") or "").lower()
+            low = url.lower()
+            if "/api/" not in low and not any(k in low for k in ("price", "sailing", "stateroom", "cabin", "vacation")):
                 return
-            item = {
-                "status": response.status,
-                "url": response.url,
-                "content_type": ct,
-            }
-            if "json" in ct.lower():
+            item = {"status": response.status, "url": url, "content_type": ct}
+            if "json" in ct:
                 try:
                     text = await response.text()
-                    item["body"] = " ".join(text.split())[:5000]
+                    item["body"] = " ".join(text.split())[:12000]
                 except Exception as exc:
                     item["body_error"] = f"{type(exc).__name__}: {exc}"
             captured.append(item)
@@ -50,59 +66,46 @@ async def _probe(browser, guests: int):
             pass
 
     page.on("response", on_response)
-    url = URLS[guests]
-    print(f"NCL_PAGE_START guests={guests} url={url}")
+    url = f"https://www.ncl.com/au/en/vacation-builder?itineraryCode={itinerary_code}&guests={guests}"
+    print(f"NCL_BUILDER_START guests={guests} url={url}")
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        print(f"NCL_PAGE_STATUS guests={guests} status={response.status if response else 'none'} final={page.url}")
+        print(f"NCL_BUILDER_STATUS guests={guests} status={response.status if response else 'none'} final={page.url}")
         await page.wait_for_timeout(12000)
     except Exception as exc:
-        print(f"NCL_PAGE_ERROR guests={guests} {type(exc).__name__}: {exc}")
+        print(f"NCL_BUILDER_ERROR guests={guests} {type(exc).__name__}: {exc}")
 
     try:
         body = " ".join((await page.locator("body").inner_text(timeout=5000)).split())
-        print(f"NCL_BODY guests={guests} {body[:12000]}")
+        print(f"NCL_BUILDER_BODY guests={guests} {body[:8000]}")
     except Exception as exc:
-        print(f"NCL_BODY_ERROR guests={guests} {type(exc).__name__}: {exc}")
+        print(f"NCL_BUILDER_BODY_ERROR guests={guests} {type(exc).__name__}: {exc}")
 
-    try:
-        links = await page.locator("a[href]").evaluate_all("els => els.map(a => a.href).filter(Boolean)")
-        useful = []
-        seen = set()
-        for href in links:
-            host = urlparse(href).netloc
-            if "ncl.com" not in host:
-                continue
-            if href in seen:
-                continue
-            seen.add(href)
-            low = href.lower()
-            if any(k in low for k in ("cruise", "vacation", "itinerary", "booking")):
-                useful.append(href)
-        print(f"NCL_LINKS guests={guests} {json.dumps(useful[:80])}")
-    except Exception as exc:
-        print(f"NCL_LINKS_ERROR guests={guests} {type(exc).__name__}: {exc}")
-
-    deduped = []
-    seen_urls = set()
+    seen = set()
+    print(f"NCL_BUILDER_NETWORK guests={guests} count={len(captured)}")
     for item in captured:
         key = (item.get("status"), item.get("url"), item.get("body", "")[:200])
-        if key in seen_urls:
+        if key in seen:
             continue
-        seen_urls.add(key)
-        deduped.append(item)
-    print(f"NCL_NETWORK guests={guests} count={len(deduped)}")
-    for item in deduped[:120]:
-        print("NCL_RESPONSE " + json.dumps(item, separators=(",", ":")))
-
+        seen.add(key)
+        print("NCL_BUILDER_RESPONSE " + json.dumps(item, separators=(",", ":")))
     await page.close()
 
 
 async def diagnostic(headless: bool = True):
     async with async_playwright() as p:
+        request = await p.request.new_context(extra_http_headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36",
+            "Accept-Language": "en-AU,en;q=0.9",
+            "Referer": "https://www.ncl.com/au/en/vacations",
+        })
+        for guests in (1, 2):
+            await _search_page(request, guests)
+        await request.dispose()
+
         browser = await p.chromium.launch(headless=headless)
         for guests in (1, 2):
-            await _probe(browser, guests)
+            await _probe_builder(browser, guests, SAMPLE_ITINERARY)
             await asyncio.sleep(1)
         await browser.close()
 
