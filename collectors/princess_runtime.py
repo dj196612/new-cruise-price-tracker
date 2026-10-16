@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
 
+from playwright.async_api import async_playwright
+
 from . import princess as base
+
+
+TEST_URL = "https://www.princess.com/itinerary-details?voyageCode=A716A"
+WATCH_RE = re.compile(r"pricing|fare|guest|occup|room|booking|quote|availability|caps|ube", re.I)
 
 
 async def _first_visible(locator):
@@ -16,194 +23,188 @@ async def _first_visible(locator):
     return None
 
 
-async def _set_guest_count(page, guests: int) -> bool:
-    """Set Princess detail-page occupancy and force pricing to reload."""
+async def _storage(page):
+    try:
+        return await page.evaluate(
+            """() => ({
+                local: Object.fromEntries(Object.entries(localStorage)),
+                session: Object.fromEntries(Object.entries(sessionStorage))
+            })"""
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+async def _dump_cookies(context, label: str):
+    cookies = await context.cookies()
+    interesting = []
+    for c in cookies:
+        n = (c.get("name") or "").lower()
+        if any(k in n for k in ("guest", "room", "occup", "book", "fare", "cruise", "geo", "country", "ube")):
+            interesting.append(f"{c.get('name')}={c.get('value')}")
+    print(f"SOLO_DIAG_{label}_COOKIES " + " | ".join(interesting))
+
+
+async def _click_one_guest(page) -> bool:
     current = await _first_visible(
         page.get_by_text(re.compile(r"1\s*room\s*/\s*\d+\s*guests?", re.I))
     )
     if current is None:
-        print("Solo guest selector: rooms/guests control not found")
+        print("SOLO_DIAG guest control not found")
         return False
 
+    await current.click(timeout=3000, force=True)
+    await page.wait_for_timeout(500)
+
+    clicked = False
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"(decrease|decrement|minus|remove).*(adult|guest)", re.I)),
+        page.get_by_role("button", name=re.compile(r"(adult|guest).*(decrease|decrement|minus|remove)", re.I)),
+        page.locator('button[aria-label*="decrease" i]'),
+        page.locator('button[aria-label*="decrement" i]'),
+        page.locator('button[aria-label*="minus" i]'),
+        page.locator('button[title*="decrease" i]'),
+    ]
+    for loc in candidates:
+        button = await _first_visible(loc)
+        if button is None:
+            continue
+        try:
+            print("SOLO_DIAG clicking decrement:", await button.get_attribute("aria-label"), await button.get_attribute("title"))
+            await button.click(timeout=2500, force=True)
+            clicked = True
+            break
+        except Exception:
+            pass
+
+    if not clicked:
+        adults = await _first_visible(page.get_by_text(re.compile(r"^Adults?$", re.I)))
+        if adults is not None:
+            node = adults
+            for depth in range(6):
+                try:
+                    node = node.locator("xpath=..")
+                    buttons = node.locator("button")
+                    visible = []
+                    for i in range(await buttons.count()):
+                        b = buttons.nth(i)
+                        if await b.is_visible() and await b.is_enabled():
+                            visible.append(b)
+                    if len(visible) >= 2:
+                        print(f"SOLO_DIAG clicking Adults-row first button at depth {depth + 1}")
+                        await visible[0].click(timeout=2500, force=True)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+    if not clicked:
+        print("SOLO_DIAG decrement not found")
+        return False
+
+    # Log panel text before applying, because it often reveals the internal count.
     try:
-        await current.click(timeout=3000, force=True)
-        await page.wait_for_timeout(500)
-    except Exception as exc:
-        print(f"Solo guest selector: could not open control: {exc}")
-        return False
-
-    if guests == 1:
-        clicked = False
-        candidates = [
-            page.get_by_role("button", name=re.compile(r"(decrease|decrement|minus|remove).*(adult|guest)", re.I)),
-            page.get_by_role("button", name=re.compile(r"(adult|guest).*(decrease|decrement|minus|remove)", re.I)),
-            page.locator('button[aria-label*="decrease" i]'),
-            page.locator('button[aria-label*="decrement" i]'),
-            page.locator('button[aria-label*="minus" i]'),
-            page.locator('button[title*="decrease" i]'),
-        ]
-        for loc in candidates:
-            button = await _first_visible(loc)
-            if button is None:
-                continue
-            try:
-                await button.click(timeout=2000, force=True)
-                clicked = True
-                break
-            except Exception:
-                pass
-
-        if not clicked:
-            adults = await _first_visible(page.get_by_text(re.compile(r"^Adults?$", re.I)))
-            if adults is not None:
-                node = adults
-                for _ in range(5):
-                    try:
-                        node = node.locator("xpath=..")
-                        buttons = node.locator("button")
-                        visible = []
-                        for i in range(await buttons.count()):
-                            b = buttons.nth(i)
-                            if await b.is_visible() and await b.is_enabled():
-                                visible.append(b)
-                        if len(visible) >= 2:
-                            await visible[0].click(timeout=2000, force=True)
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-
-        if not clicked:
-            print("Solo guest selector: adult decrement button not found")
-            return False
+        body = " ".join((await page.locator("body").inner_text()).split())
+        m = re.search(r"Adults.{0,120}", body, re.I)
+        if m:
+            print("SOLO_DIAG_ADULTS_TEXT", m.group(0))
+    except Exception:
+        pass
 
     for label in (r"^Apply$", r"^Done$", r"^Save$", r"^Update$", r"^Continue$"):
         button = await _first_visible(page.get_by_role("button", name=re.compile(label, re.I)))
         if button is not None:
             try:
-                await button.click(timeout=2200, force=True)
+                print("SOLO_DIAG applying guest change with", await button.inner_text())
+                await button.click(timeout=2500, force=True)
                 break
             except Exception:
                 pass
 
-    confirmed = False
-    for _ in range(16):
+    for _ in range(20):
         try:
-            body = " ".join((await page.locator("body").inner_text()).split())
-            if re.search(rf"1\s*room\s*/\s*{guests}\s*guests?", body, re.I):
-                confirmed = True
-                break
+            text = " ".join((await page.locator("body").inner_text()).split())
+            if re.search(r"1\s*room\s*/\s*1\s*guest", text, re.I):
+                print("SOLO_DIAG occupancy confirmed: 1 room / 1 guest")
+                return True
         except Exception:
             pass
         await page.wait_for_timeout(500)
 
-    if not confirmed:
-        print(f"Solo guest selector: occupancy did not confirm {guests} guest(s)")
-        return False
-
-    print(f"Solo guest selector: confirmed 1 room / {guests} guest{'s' if guests != 1 else ''}")
-
-    # Princess updates the occupancy summary but often leaves the existing fare
-    # component cached. Reload the itinerary after the new occupancy has been
-    # saved so the pricing API is initialised again using the 1-adult state.
-    try:
-        await page.reload(wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1800)
-        await base.dismiss_noise(page)
-    except Exception as exc:
-        print(f"Solo guest selector: reload after guest change failed: {exc}")
-        return False
-
-    persisted = False
-    for _ in range(16):
-        try:
-            body = " ".join((await page.locator("body").inner_text()).split())
-            if re.search(rf"1\s*room\s*/\s*{guests}\s*guests?", body, re.I):
-                persisted = True
-                break
-        except Exception:
-            pass
-        await page.wait_for_timeout(500)
-
-    if persisted:
-        print(f"Solo guest selector: {guests}-guest occupancy persisted after reload")
-    else:
-        print(f"Solo guest selector: {guests}-guest occupancy did not persist after reload")
-    return persisted
-
-
-# base.scrape_detail calls wait_for_cabin_prices twice on each page: first for the
-# default 2-person fares, then again after switching to 1 guest. Keep the first
-# cabin-price set and only accept the second when Princess returns a genuinely
-# different quote.
-_original_wait_for_cabin_prices = base.wait_for_cabin_prices
-_first_prices_by_page: dict[int, dict] = {}
-
-
-async def _wait_for_fresh_cabin_prices(page, timeout_seconds: int = 20) -> str:
-    key = id(page)
-
-    if key not in _first_prices_by_page:
-        body = await _original_wait_for_cabin_prices(page, timeout_seconds)
-        _first_prices_by_page[key] = base.cabin_prices(body)
-        return body
-
-    original = _first_prices_by_page[key]
-    last_body = ""
-    # Give the reloaded solo pricing request a longer window than the normal
-    # detail-page load. Princess fare responses can be slow on GitHub runners.
-    loops = max(timeout_seconds, 30) * 2
-    for _ in range(loops):
-        try:
-            last_body = " ".join((await page.locator("body").inner_text()).split())
-            current = base.cabin_prices(last_body)
-            has_price = any(v is not None for v in current.values())
-            changed = any(current.get(c) != original.get(c) for c in base.CABINS)
-            if has_price and changed:
-                print(
-                    "Solo fare refresh: prices changed after switching to 1 guest "
-                    f"(Interior {original.get('interior')} -> {current.get('interior')})"
-                )
-                return last_body
-        except Exception:
-            pass
-        await page.wait_for_timeout(500)
-
-    print("Solo fare refresh: no changed fare received; leaving solo pricing unavailable")
-    return ""
+    print("SOLO_DIAG occupancy did not confirm")
+    return False
 
 
 async def collect(headless: bool = True):
-    base.set_guest_count_on_detail = _set_guest_count
-    base.wait_for_cabin_prices = _wait_for_fresh_cabin_prices
+    print("Running one-voyage Princess solo network diagnostic for A716A")
 
-    try:
-        records = await base.collect(headless=headless)
-    finally:
-        base.wait_for_cabin_prices = _original_wait_for_cabin_prices
-        _first_prices_by_page.clear()
-
-    priced = [r for r in records if r.get("two_guest_interior_pp") is not None]
-    if not priced:
-        raise RuntimeError(
-            "Princess returned no usable cabin prices. Refusing to overwrite the live dashboard."
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            locale="en-AU",
+            timezone_id="Australia/Sydney",
+            viewport={"width": 1440, "height": 1000},
+            extra_http_headers={"Accept-Language": "en-AU,en;q=0.9"},
         )
+        await context.add_cookies([
+            {"name": "cookie_geo_country", "value": "AU", "domain": ".princess.com", "path": "/"},
+            {"name": "cookie_url_country", "value": "AU", "domain": ".princess.com", "path": "/"},
+        ])
 
-    non_aud = [r for r in priced if (r.get("currency") or "").upper() != "AUD"]
-    if non_aud:
-        currencies = sorted({(r.get("currency") or "UNKNOWN").upper() for r in non_aud})
-        raise RuntimeError(
-            f"Princess returned non-AUD pricing ({', '.join(currencies)}). "
-            "Refusing to overwrite the live dashboard."
-        )
+        async def force_locale(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(base.AU_LOCALE))
 
-    solo_priced = sum(1 for r in records if r.get("one_guest_interior") is not None)
-    identical = sum(
-        1 for r in records
-        if r.get("one_guest_interior") is not None
-        and r.get("two_guest_interior_pp") is not None
-        and r.get("one_guest_interior") == r.get("two_guest_interior_pp")
+        await context.route(base.LOCALE_URL, force_locale)
+
+        page = await context.new_page()
+        phase = {"value": "LOAD"}
+
+        def on_request(request):
+            if not WATCH_RE.search(request.url):
+                return
+            try:
+                post = request.post_data or ""
+            except Exception:
+                post = ""
+            # Limit large payloads while preserving all occupancy-related content.
+            if len(post) > 5000:
+                post = post[:5000] + "...<truncated>"
+            print(
+                f"SOLO_DIAG_REQ_{phase['value']} method={request.method} url={request.url} post={post}"
+            )
+
+        async def on_response(response):
+            if not WATCH_RE.search(response.url):
+                return
+            print(f"SOLO_DIAG_RESP_{phase['value']} status={response.status} url={response.url}")
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        await page.goto(TEST_URL, wait_until="domcontentloaded", timeout=90000)
+        await base.dismiss_noise(page)
+        body = await base.wait_for_cabin_prices(page, 25)
+        print("SOLO_DIAG_2P_PRICES", json.dumps(base.cabin_prices(body), sort_keys=True))
+        print("SOLO_DIAG_STORAGE_BEFORE", json.dumps(await _storage(page), sort_keys=True)[:12000])
+        await _dump_cookies(context, "BEFORE")
+
+        phase["value"] = "GUEST_CHANGE"
+        ok = await _click_one_guest(page)
+        print("SOLO_DIAG_GUEST_CHANGE_OK", ok)
+        await page.wait_for_timeout(8000)
+
+        try:
+            body_after = " ".join((await page.locator("body").inner_text()).split())
+            print("SOLO_DIAG_1P_VISIBLE_PRICES", json.dumps(base.cabin_prices(body_after), sort_keys=True))
+        except Exception as exc:
+            print("SOLO_DIAG_1P_VISIBLE_ERROR", exc)
+
+        print("SOLO_DIAG_STORAGE_AFTER", json.dumps(await _storage(page), sort_keys=True)[:12000])
+        await _dump_cookies(context, "AFTER")
+
+        await page.close()
+        await browser.close()
+
+    raise RuntimeError(
+        "Princess solo diagnostic complete. Inspect SOLO_DIAG_REQ_GUEST_CHANGE and storage/cookie deltas."
     )
-    print(f"Princess solo Interior pricing captured for {solo_priced}/{len(records)} cruises; {identical} identical to 2-person pp fare.")
-
-    return records
