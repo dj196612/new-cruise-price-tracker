@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
-LANDING_URL = "https://www.princess.com/en-au/cruise-search/"
+LANDING_URL = "https://www.princess.com/cruise-search/"
 PORTS = ("Sydney", "Melbourne", "Brisbane")
 CABINS = ("interior", "oceanview", "balcony", "mini_suite", "suite")
 
@@ -59,7 +59,6 @@ def departure_port(text: str) -> Optional[str]:
     m = ROUTE_RE.search(text or "")
     if m:
         return m.group(1).title()
-    # Roundtrip form.
     m = re.search(r"Roundtrip\s+from\s+(Sydney|Melbourne|Brisbane),\s*Australia", text or "", re.I)
     if m:
         return m.group(1).title()
@@ -304,7 +303,6 @@ async def scrape_detail(context: BrowserContext, item: dict, semaphore: asyncio.
             two = cabin_prices(body)
             currency = detect_currency(body)
 
-            # Header/detail metadata only. Search card remains the primary source for name/nights/port.
             h1_text = ""
             try:
                 h1 = page.locator("h1")
