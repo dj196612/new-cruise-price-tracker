@@ -9,6 +9,7 @@ function selectedPorts(){ return [...document.querySelectorAll("#ports input:che
 function departurePortName(c){ return portNames[c.departure_port] || c.departure_port; }
 function cabin(){ return $("#cabin").value; }
 function isPrincess(c){ return c.line === "Princess"; }
+function isCelebrity(c){ return c.line === "Celebrity Cruises"; }
 function packageAddon(c){
   if(!isPrincess(c)) return 0;
   const p=$("#farePackage").value;
@@ -66,11 +67,20 @@ function sortRows(rows){
 }
 function dateFmt(s){ return !s?"":new Date(s+"T12:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"}); }
 function packageLabel(c){
-  if(!isPrincess(c)) return c.fare_basis || "Royal Caribbean Fare";
+  if(!isPrincess(c)) return c.fare_basis || (isCelebrity(c)?"Celebrity Fare":"Royal Caribbean Fare");
   return {standard:"Princess Standard",plus:"Princess Plus",premier:"Princess Premier"}[$("#farePackage").value];
 }
-function lineUrl(c){ return c.url || (isPrincess(c)?"https://www.princess.com":"https://www.royalcaribbean.com/aus/en/cruises"); }
-function lineLinkLabel(c){ return isPrincess(c)?"View on Princess":"View on Royal Caribbean"; }
+function lineUrl(c){
+  if(c.url) return c.url;
+  if(isPrincess(c)) return "https://www.princess.com";
+  if(isCelebrity(c)) return "https://www.celebritycruises.com/au/cruises";
+  return "https://www.royalcaribbean.com/aus/en/cruises";
+}
+function lineLinkLabel(c){
+  if(isPrincess(c)) return "View on Princess";
+  if(isCelebrity(c)) return "View on Celebrity";
+  return "View on Royal Caribbean";
+}
 function card(c){
   const p=priceFor(c), ppn=perNight(c), total=currentTotal(c), cur=c.currency||"AUD", low=historicalLow(c), change=priceChange(c), solo=soloPremium(c);
   const changeText = change==null?"":`<span class="badge ${change<0?"drop":"rise"}">${change<0?"↓":"↑"} ${money(Math.abs(change),cur)} since previous check</span>`;
