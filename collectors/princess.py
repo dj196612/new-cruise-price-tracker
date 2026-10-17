@@ -380,6 +380,46 @@ async def scrape_detail(context: BrowserContext, item: dict, semaphore: asyncio.
             await page.close()
 
 
+# ---- coverage diagnostic: what the search page's own data feeds list ----
+_AU_START = {"SYD", "MEL", "BNE"}
+_VOYAGE_RE = re.compile(r"^[A-Z0-9]{3,6}$")
+
+
+def _port_code(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("code") or value.get("portCode") or ""
+    return str(value or "").upper()
+
+
+def _walk_voyages(obj, out: dict, depth: int = 0) -> None:
+    """Collect {voyage id: start port} from any Princess JSON feed."""
+    if depth > 10:
+        return
+    if isinstance(obj, dict):
+        vid = None
+        for key in ("voyageCode", "cruiseId", "productId"):
+            value = str(obj.get(key) or "").upper()
+            if _VOYAGE_RE.match(value):
+                vid = value
+                break
+        if vid:
+            port = ""
+            for key, value in obj.items():
+                low = key.lower()
+                if "port" in low and any(w in low for w in ("start", "embark", "depart", "from")):
+                    port = _port_code(value)
+                    if port:
+                        break
+            if vid not in out or (port and not out[vid]):
+                out[vid] = port
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                _walk_voyages(value, out, depth + 1)
+    elif isinstance(obj, list):
+        for value in obj[:3000]:
+            _walk_voyages(value, out, depth + 1)
+
+
 async def collect(headless=True):
     debug = Path("debug")
     debug.mkdir(exist_ok=True)
@@ -404,9 +444,35 @@ async def collect(headless=True):
         await context.route(LOCALE_URL, force_locale)
 
         search_page = await context.new_page()
+        feeds: dict[str, dict] = {}
+
+        async def sniff(resp):
+            if "princess.com" not in resp.url or "json" not in (resp.headers.get("content-type") or ""):
+                return
+            try:
+                found: dict = {}
+                _walk_voyages(await resp.json(), found)
+            except Exception:
+                return
+            if found:
+                feeds.setdefault(resp.url.split("?", 1)[0][-90:], {}).update(found)
+
+        search_page.on("response", sniff)
         expected = await select_australian_departure_ports(search_page)
         items = await collect_search_items(search_page, expected)
         await search_page.close()
+
+        collected = {i["voyage_code"].upper() for i in items}
+        all_au: set = set()
+        for url, found in feeds.items():
+            au = {v for v, port in found.items() if port in _AU_START}
+            all_au |= au
+            print(f"Princess coverage feed {url}: {len(found)} voyages, {len(au)} starting SYD/MEL/BNE")
+        missing = sorted(all_au - collected)
+        print(
+            f"Princess coverage: search button reported {expected}, collected {len(collected)}; "
+            f"feeds list {len(all_au)} voyages starting SYD/MEL/BNE; {len(missing)} not collected: {missing[:40]}"
+        )
 
         semaphore = asyncio.Semaphore(3)
         scraped = await asyncio.gather(
