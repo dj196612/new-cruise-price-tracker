@@ -207,11 +207,12 @@ async def _scrape_detail_fixed(context, item: dict, semaphore: asyncio.Semaphore
             await page.close()
 
 
-# The 2-guest price on the dashboard is scraped from the page as Princess
-# Standard (fare_basis "Princess Standard", Plus shown as a per-night add-on),
-# so solo must be requested on the same fare type or solo premium % compares
-# Standard against Plus.
-SOLO_FARE_TYPE = "BESTFARE"
+# The 2-guest price scraped from the Princess page is the Princess Plus fare:
+# calibration on 17 Oct 2026 matched the API's BESTVALUE fare to the page
+# price exactly (ratio 1.000 on 8 voyages) while BESTFARE (Standard) was
+# 0.67-0.78x. Solo must use the same fare type or solo premium compares
+# Standard with Plus.
+SOLO_FARE_TYPE = "BESTVALUE"
 BOOKABLE_STATUSES = {"Y", "G", "B", "A"}
 _ID_KEYS = ("cruiseId", "voyageCode", "productId", "id", "code")
 
@@ -464,10 +465,10 @@ async def _fetch_fares(session: "_PricingSession", code: str, guests: int):
     notes: list[str] = []
     prices, statuses, cruises, data, seen = None, Counter(), [], None, []
     for path_code in attempts:
-        # Some voyages return 403 when requested on the Standard flag but price
-        # normally on the Plus flag; the response carries every fare type
-        # either way and we still read the Standard (BESTFARE) fare from it.
-        for flag in (SOLO_FARE_TYPE, "BESTVALUE"):
+        # Some voyages return 403 on one fare-type flag but price normally on
+        # the other; the response carries every fare type either way and we
+        # still read SOLO_FARE_TYPE from it.
+        for flag in (SOLO_FARE_TYPE, "BESTFARE" if SOLO_FARE_TYPE != "BESTFARE" else "BESTVALUE"):
             status, data = await _post_pricing(session, _solo_payload(session.template, guests, flag), path_code)
             if status == 200:
                 if flag != SOLO_FARE_TYPE:

@@ -15,9 +15,10 @@ function isNcl(c){ return c.line === "Norwegian Cruise Line"; }
 function isCarnival(c){ return c.line === "Carnival Cruise Line"; }
 function packageAddon(c){
   if(!isPrincess(c)) return 0;
+  // Princess prices are the listed Princess Plus fare; other packages are estimates.
   const p=$("#farePackage").value;
-  if(p==="plus") return (c.plus_addon_per_night ?? 79) * (c.nights||0);
-  if(p==="premier") return (c.premier_addon_per_night ?? 129) * (c.nights||0);
+  if(p==="standard") return -(c.standard_discount_per_night ?? 79) * (c.nights||0);
+  if(p==="premier") return (c.premier_addon_per_night ?? 50) * (c.nights||0);
   return 0;
 }
 function basePriceFor(c){

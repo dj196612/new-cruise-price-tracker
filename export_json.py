@@ -20,9 +20,13 @@ def main():
 
         line = r.get("line")
         if line == "Princess":
-            r["fare_basis"] = "Princess Standard"
-            r["plus_addon_per_night"] = 79
-            r["premier_addon_per_night"] = 129
+            # Prices are Princess Plus (what princess.com lists; solo is priced
+            # on the same fare). Other packages are per-night estimates
+            # relative to Plus: Standard ~$79/night less, Premier ~$50/night more.
+            r["fare_basis"] = "Princess Plus"
+            r["plus_addon_per_night"] = 0
+            r["premier_addon_per_night"] = 50
+            r["standard_discount_per_night"] = 79
         elif line == "Celebrity Cruises":
             r["fare_basis"] = "Celebrity Fare"
             r["plus_addon_per_night"] = None
