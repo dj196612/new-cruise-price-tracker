@@ -44,7 +44,7 @@ jobs:
             echo "::error title=Royal Caribbean tracker failed (last 40 lines)::$(tail -n 40 run.log | enc)"
             exit 1
           fi
-          echo "::notice title=Royal Caribbean solo summary::$(grep -iE 'solo (result|graph|repair|interior pricing|currency)|solo Interior pricing|production result' run.log | tail -n 30 | enc)"
+          echo "::notice title=Royal Caribbean solo summary::$(grep -iE ' coverage:|solo (result|graph|repair|interior pricing|currency)|solo Interior pricing|production result' run.log | tail -n 30 | enc)"
           if grep -q "solo empty" run.log; then echo "::notice title=Royal Caribbean empty solo reasons ($(grep -c "solo empty" run.log) sailings)::$(grep "solo empty" run.log | head -n 8 | enc)"; fi
 
       - name: Commit updated cruise data

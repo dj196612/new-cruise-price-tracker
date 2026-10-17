@@ -85,6 +85,18 @@ async def _search_all(request) -> list[dict]:
         if len(rows) < PAGE_SIZE:
             break
         offset += len(rows)
+
+    # Coverage check: how many cruise itineraries leave other Australian ports.
+    for port in ("BNE", "MEL"):
+        body = await _get_json(
+            request,
+            SEARCH_API,
+            params={"embPorts": port, "guests": "2", "filterConfig": "search-filters-configuration", "limit": str(PAGE_SIZE), "offset": "0"},
+            label=f"coverage {port}",
+        )
+        rows = (body or {}).get("itineraries") or []
+        here = [r for r in rows if _is_cruise_only(r) and ((r.get("embarkationPort") or {}).get("code") or "").upper() == port]
+        print(f"NCL coverage: {len(here)} cruise itineraries from {port} (first page); tracking SYD only")
     return list(found.values())
 
 

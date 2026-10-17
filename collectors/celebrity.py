@@ -122,6 +122,7 @@ async def _search_all(request) -> list[dict]:
     total = None
     skip = 0
     local: list[dict] = []
+    oz_ports: dict[str, int] = {}
     while total is None or skip < total:
         page_total, cruises = await _catalogue_page(request, skip)
         if total is None:
@@ -131,7 +132,11 @@ async def _search_all(request) -> list[dict]:
             break
         for cruise in cruises:
             itinerary = ((cruise.get("masterSailing") or {}).get("itinerary") or {})
-            dep = ((itinerary.get("departurePort") or {}).get("code") or "").upper()
+            port = itinerary.get("departurePort") or {}
+            dep = (port.get("code") or "").upper()
+            if (port.get("countryCode") or "").upper() in ("AUS", "AU", "NZL", "NZ"):
+                key = f"{dep} {port.get('name') or ''}".strip()
+                oz_ports[key] = oz_ports.get(key, 0) + len(cruise.get("sailings") or [])
             if dep in PORTS:
                 local.append(cruise)
         print(
@@ -139,6 +144,7 @@ async def _search_all(request) -> list[dict]:
             f"Sydney groups so far={len(local)}"
         )
         skip += len(cruises)
+    print(f"Celebrity coverage: sailings by AU/NZ departure port in catalogue {dict(sorted(oz_ports.items(), key=lambda kv: -kv[1]))}; tracking {PORTS}")
     return local
 
 

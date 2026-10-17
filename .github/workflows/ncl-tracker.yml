@@ -35,7 +35,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run NCL tracker
-        run: python run_ncl.py
+        shell: bash
+        run: |
+          set -o pipefail
+          enc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}'; }
+          if ! python run_ncl.py 2>&1 | tee run.log; then
+            echo "::error title=NCL tracker failed (last 40 lines)::$(tail -n 40 run.log | enc)"
+            exit 1
+          fi
+          echo "::notice title=NCL summary::$(grep -iE 'coverage:|production result|returned' run.log | tail -n 15 | enc)"
 
       - name: Commit updated cruise data
         shell: bash
