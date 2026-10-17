@@ -46,7 +46,8 @@ function soloPremium(c){
 function passes(c){
   if(!selectedLines().includes(c.line)) return false;
   if(!selectedPorts().includes(departurePortName(c))) return false;
-  if(!isPrincess(c) && $("#farePackage").value!=="standard") return false;
+  // Other lines only have listed fares; hide them when a Princess estimate (Standard/Premier) is chosen.
+  if(!isPrincess(c) && $("#farePackage").value!=="plus") return false;
   if(c.nights && c.nights < (+$("#minNights").value||0)) return false;
   if(c.nights && c.nights > (+$("#maxNights").value||999)) return false;
   if($("#dateFrom").value && c.departure_date < $("#dateFrom").value) return false;
@@ -115,7 +116,7 @@ function card(c){
       <div class="secondary">
         ${$("#passengers").value==="2" && total!=null ? `2-person total: <b>${money(total,cur)}</b><br>` : ""}
         Base ${cabinLabels[cabin()]}: <b>${money(basePriceFor(c),cur)}</b><br>
-        ${isPrincess(c)&&$("#farePackage").value!=="standard"&&p!=null?`Package add-on: <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
+        ${isPrincess(c)&&$("#farePackage").value!=="plus"&&p!=null?`Package adjustment (est.): <b>${money(packageAddon(c),cur)} pp</b><br>`:""}
         Solo premium: <b>${pct(solo)}</b><br>
         Historical low: <b>${money(low,cur)}</b>
       </div>
@@ -139,7 +140,7 @@ window.showHistory=function(id){
 function reset(){
   document.querySelectorAll("#cruiseLines input").forEach(x=>x.checked=true);
   document.querySelectorAll("#ports input").forEach(x=>x.checked=true);
-  $("#passengers").value="2"; $("#cabin").value="interior"; $("#farePackage").value="standard";
+  $("#passengers").value="2"; $("#cabin").value="interior"; $("#farePackage").value="plus";
   $("#minNights").value=1; $("#maxNights").value=""; $("#dateFrom").value=""; $("#dateTo").value=""; $("#maxPrice").value="";
   $("#ship").value=""; $("#sort").value="dayprice"; $("#available").checked=false; $("#dropped").checked=false; render();
 }
